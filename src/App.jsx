@@ -88,13 +88,15 @@ const App = () => {
   const [selectedError, setSelectedError] = useState(null); // The error object being viewed
   const [isFullScreen, setIsFullScreen] = useState(false);
 
-  // Set the default error suggestion to the first one available
+  // Set the default error suggestion to the first one available, only once after content is loaded
   useEffect(() => {
-    if (analyzedContent && analyzedContent.suggestedImprovements.length > 0) {
+    if (analyzedContent && analyzedContent.suggestedImprovements.length > 0 && !selectedError) {
       setSelectedError(analyzedContent.suggestedImprovements[0]);
-    } else {
+    } else if (analyzedContent && analyzedContent.suggestedImprovements.length === 0) {
       setSelectedError(null);
     }
+    // Note: Do not include selectedError in deps, otherwise it resets after every click
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [analyzedContent]);
 
   // Handler for clicking on a highlighted error in the text box
@@ -105,6 +107,8 @@ const App = () => {
       const error = analyzedContent.suggestedImprovements.find(imp => imp.errorId === errorId);
       if (error) {
         setSelectedError(error);
+        // Optional: Scroll the highlighted suggestion into view
+        document.getElementById(`error-${error.errorId}`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
     }
   }, [analyzedContent]);
@@ -136,6 +140,7 @@ const App = () => {
     } else {
         setAnalyzedContent(null);
         tempContent = null;
+        setSelectedError(null); // Clear selected error for new analysis
     }
 
     // Determine the user query and system prompt based on whether we are refreshing
@@ -264,7 +269,7 @@ const App = () => {
             {/* Error Detection Box (Output 1) */}
             <div className="mt-8">
               <h3 className="text-lg font-semibold text-gray-700 mb-3 flex items-center">
-                <CheckCircle className="mr-2 h-5 w-5 text-green-500" /> Error-Checked Text (Click Red Text for Suggestions)
+                <CheckCircle className="mr-2 h-5 w-5 text-green-500" /> Error-Checked Text (Click Red Text to Highlight Suggestion)
               </h3>
               <div 
                 className="min-h-[150px] p-4 bg-gray-50 border border-red-300 rounded-lg text-gray-800 leading-relaxed"
@@ -278,26 +283,44 @@ const App = () => {
         {/* --- RIGHT COLUMN: Suggestions and Headlines --- */}
         <div className="col-span-1">
             
-          {/* Suggested Improvement Box (Output 2) */}
+          {/* Suggested Improvement Box (Output 2) - Now shows ALL suggestions */}
           <div className="mb-6 bg-white p-6 rounded-xl shadow-lg border border-gray-200">
             <h2 className="text-xl font-semibold text-gray-700 mb-3 flex items-center">
-              <Lightbulb className="mr-2 h-5 w-5 text-yellow-500" /> Suggested Improvement
+              <Lightbulb className="mr-2 h-5 w-5 text-yellow-500" /> All Detected Errors & Suggestions
             </h2>
-            <div className='min-h-[100px]'>
-              {selectedError ? (
-                <div className='space-y-3'>
-                  <p className="text-sm text-gray-600 font-medium">Original Error:</p>
-                  <p className="p-2 bg-red-100 text-red-800 rounded-md font-mono">{selectedError.original}</p>
-                  <p className="text-sm text-gray-600 font-medium">Suggested Correction:</p>
-                  <p className="p-2 bg-green-100 text-green-800 rounded-md font-mono">{selectedError.correction}</p>
-                  <p className="text-xs text-gray-500 mt-2">
-                    Click on any other highlighted red word in the text box to see its suggestion here.
-                  </p>
-                </div>
-              ) : (
-                <p className='text-gray-500 italic'>Click on a highlighted error in the text box after analysis to see the correction here.</p>
-              )}
-            </div>
+            
+            {analyzedContent?.suggestedImprovements?.length > 0 ? (
+              <div className="max-h-96 overflow-y-auto space-y-2">
+                {analyzedContent.suggestedImprovements.map((item) => (
+                  <div 
+                    key={item.errorId}
+                    id={`error-${item.errorId}`} // ID for smooth scrolling
+                    className={`p-3 rounded-lg border cursor-pointer transition-all duration-300 ${
+                      selectedError?.errorId === item.errorId 
+                        ? 'bg-yellow-100 border-yellow-500 shadow-md transform scale-[1.01]' 
+                        : 'bg-white hover:bg-gray-50 border-gray-300'
+                    }`}
+                    onClick={() => setSelectedError(item)}
+                  >
+                    <p className="font-medium text-sm text-gray-800 flex justify-between items-center">
+                      <span>Error {item.errorId}:</span> 
+                      <span className="text-red-600 font-semibold">{item.original}</span>
+                    </p>
+                    <p className="text-xs text-gray-600 mt-1 flex justify-between items-start">
+                      <span>Correction:</span>
+                      <span className="text-green-600 font-medium ml-4 text-right">{item.correction}</span>
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className='text-gray-500 italic min-h-[100px]'>
+                {isLoading ? "Analyzing text for errors..." : "Suggestions will appear here after analysis."}
+              </p>
+            )}
+            <p className="text-xs text-gray-500 mt-4 border-t pt-2">
+              *The AI currently returns only the specific incorrect word/phrase and its correction.
+            </p>
           </div>
 
           {/* Headline Generation Box (Output 3) */}
@@ -336,7 +359,7 @@ const App = () => {
 
             {/* Headlines List */}
             <div className="max-h-96 overflow-y-auto space-y-4">
-              {isLoading && analyzedContent ? (
+              {isLoading && analyzedContent && analyzedContent.headlines.length === 0 ? (
                 <div className="flex justify-center items-center h-20">
                     <Loader2 className="h-8 w-8 text-purple-500 animate-spin" />
                 </div>
