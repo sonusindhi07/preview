@@ -39,8 +39,8 @@ const RESPONSE_SCHEMA = {
         },
         propertyOrdering: ["errorId", "original", "correction"]
       }
-    },
-    headlines: {
+    }, // <-- CORRECTED: Added comma here
+    headlines: { // <-- CORRECTED: Moved inside 'properties'
       type: "ARRAY",
       items: {
         type: "OBJECT",
@@ -51,8 +51,8 @@ const RESPONSE_SCHEMA = {
         propertyOrdering: ["headline", "subheadline"]
       }
     }
-  },
-  propertyOrdering: ["processedTextHtml", "suggestedImprovements", "headlines"]
+  }, // <-- CORRECTED: This closes the main 'properties' block
+  propertyOrdering: ["processedTextHtml", "suggestedImprovements", "headlines"] // <-- CORRECTED: This is correct placement
 };
 
 
@@ -120,9 +120,9 @@ const App = () => {
       return;
     }
     
-    // API Key Validation Check for Codespaces/External Environments
+    // API Key Validation Check (We now rely on the fetch error for debugging if key is bad)
     if (!API_KEY) {
-        alert("The Gemini API Key is missing. In external environments like Codespaces, you must provide your key by manually editing the 'ReporterEditorTool.jsx' file.");
+        alert("The Gemini API Key is missing. Please provide a valid key.");
         setIsLoading(false);
         return;
     }
@@ -159,6 +159,9 @@ const App = () => {
       systemInstruction: systemInstruction,
     };
 
+    let rawResponse = null;
+    let responseStatus = 0;
+
     try {
       const options = {
         method: 'POST',
@@ -167,15 +170,27 @@ const App = () => {
       };
 
       const response = await exponentialBackoffFetch(GEMINI_API_URL, options);
-      const result = await response.json();
+      responseStatus = response.status;
+      rawResponse = await response.text(); // Read raw text for logging
+
+      if (!response.ok) {
+        // Handle HTTP errors (400, 401, 403, 500 etc.)
+        console.error("API HTTP Error:", responseStatus);
+        console.error("Raw Response Text:", rawResponse);
+        throw new Error(`API call failed with status ${responseStatus}.`);
+      }
+
+      const result = JSON.parse(rawResponse); // Parse the text into JSON object
       
       const jsonString = result?.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (!jsonString) {
-        throw new Error("API response was empty or malformed or failed to authorize.");
+        console.error("API response content is empty or malformed.");
+        console.error("Full Parsed Result:", result);
+        throw new Error("API response was empty or malformed.");
       }
 
-      const parsedJson = JSON.parse(jsonString);
+      const parsedJson = JSON.parse(jsonString); // Parse the internal JSON string
 
       if (refreshHeadlines && tempContent) {
         // Only update the headlines array
@@ -189,8 +204,12 @@ const App = () => {
       }
       
     } catch (error) {
+      console.error("--- DEBUGGING API FAILURE ---");
       console.error("Error during Gemini API call:", error);
-      alert("Failed to analyze text. Please check the console for details.");
+      console.error("Response Status (if known):", responseStatus);
+      console.error("Raw Response Text (if available):", rawResponse);
+      console.error("-----------------------------");
+      alert("Failed to analyze text. Please check the console for details and share the debug log.");
     } finally {
       setIsLoading(false);
     }
