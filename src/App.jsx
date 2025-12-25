@@ -17,8 +17,8 @@ import {
 } from 'lucide-react';
 
 // --- API CONFIGURATION ---
-const BASE_URL = 'https://694d4185ad0f8c8e6e203206.mockapi.io/vault';
-const RESOURCE_ID = '1'; // We'll use a single document to store the nested structure for simplicity
+const BASE_URL = 'https://694d4185ad0f8c8e6e203206.mockapi.io/albums';
+const RESOURCE_ID = '1'; // Using a single document to store the nested structure
 
 // --- STATE MANAGEMENT ---
 const initialState = {
@@ -67,11 +67,12 @@ const App = () => {
       if (!response.ok) {
         // If 404, the resource might not exist yet, initialize it
         if (response.status === 404) {
-          await fetch(BASE_URL, {
+          const createResponse = await fetch(BASE_URL, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ id: RESOURCE_ID, data: [] })
           });
+          if (!createResponse.ok) throw new Error('Could not initialize storage');
           dispatch({ type: 'FETCH_SUCCESS', payload: [] });
           return;
         }
@@ -231,7 +232,7 @@ const App = () => {
       <div className="fixed inset-0 flex flex-col items-center justify-center bg-white z-[100]">
         <Loader2 className="w-10 h-10 text-indigo-600 animate-spin mb-4" />
         <p className="text-xs font-black text-slate-400 uppercase tracking-widest text-center">
-          Connecting to MockAPI...
+          Connecting to MockAPI Albums...
         </p>
       </div>
     );
@@ -258,12 +259,12 @@ const App = () => {
         {syncing ? (
           <>
             <Loader2 size={12} className="text-indigo-600 animate-spin" /> 
-            <span className="text-indigo-600">Syncing to MockAPI...</span>
+            <span className="text-indigo-600">Syncing to Albums...</span>
           </>
         ) : (
           <>
             <CheckCircle2 size={12} className="text-green-500" /> 
-            <span className="text-slate-500">MockAPI Live</span>
+            <span className="text-slate-500">Albums Live</span>
           </>
         )}
       </div>
