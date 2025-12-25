@@ -13,17 +13,21 @@ import {
   FolderUp,
   Loader2,
   ChevronRightSquare,
-  FileUp
+  FileUp,
+  CheckCircle2,
+  AlertCircle
 } from 'lucide-react';
 
 // --- API CONFIGURATION ---
+// Using the user-provided MockAPI endpoint
 const API_BASE = "https://694d4185ad0f8c8e6e203206.mockapi.io/albums";
 
 // --- STATE MANAGEMENT ---
 const initialState = {
   items: [],
-  status: 'idle',
-  error: null
+  status: 'idle', // 'idle' | 'loading' | 'succeeded' | 'failed'
+  error: null,
+  syncing: false
 };
 
 function albumReducer(state, action) {
@@ -34,6 +38,10 @@ function albumReducer(state, action) {
       return { ...state, status: 'succeeded', items: action.payload };
     case 'FETCH_ERROR':
       return { ...state, status: 'failed', error: action.payload };
+    case 'SYNC_START':
+      return { ...state, syncing: true };
+    case 'SYNC_END':
+      return { ...state, syncing: false };
     case 'SET_ITEMS':
       return { ...state, items: action.payload };
     default:
@@ -43,7 +51,7 @@ function albumReducer(state, action) {
 
 const App = () => {
   const [state, dispatch] = useReducer(albumReducer, initialState);
-  const { items: albums, status } = state;
+  const { items: albums, status, syncing, error } = state;
   
   const [currentPath, setCurrentPath] = useState([]); 
   const [isCreatingAlbum, setIsCreatingAlbum] = useState(false);
@@ -51,30 +59,53 @@ const App = () => {
   const [viewerIndex, setViewerIndex] = useState(null); 
   const [showAllNested, setShowAllNested] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+
+  // --- UPLOAD PROGRESS STATE ---
+  const [uploadProgress, setUploadProgress] = useState({ active: false, percent: 0, fileName: '' });
   
   const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
 
-  // API Actions
-  const fetchAlbums = async () => {
-    dispatch({ type: 'FETCH_START' });
+  // --- BACKEND API ACTIONS ---
+  
+  // Exponential backoff fetch helper
+  const fetchWithRetry = async (url, options = {}, retries = 5, backoff = 1000) => {
     try {
-      const response = await fetch(API_BASE);
-      const data = await response.json();
-      const remoteData = data.find(item => item.id === "1")?.data;
-      dispatch({ type: 'FETCH_SUCCESS', payload: remoteData || [] });
+      const response = await fetch(url, options);
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      return await response.json();
     } catch (err) {
-      dispatch({ type: 'FETCH_ERROR', payload: err.message });
+      if (retries > 0) {
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return fetchWithRetry(url, options, retries - 1, backoff * 2);
+      }
+      throw err;
     }
   };
 
-  const syncAlbums = async (newAlbums) => {
+  const fetchAlbums = async () => {
+    dispatch({ type: 'FETCH_START' });
     try {
+      const data = await fetchWithRetry(API_BASE);
+      // MockAPI returns an array. We look for our specific document "1"
+      const remoteEntry = data.find(item => item.id === "1");
+      dispatch({ type: 'FETCH_SUCCESS', payload: remoteEntry?.data || [] });
+    } catch (err) {
+      dispatch({ type: 'FETCH_ERROR', payload: "Failed to connect to backend storage." });
+    }
+  };
+
+  const syncToBackend = async (newAlbums) => {
+    dispatch({ type: 'SYNC_START' });
+    try {
+      // We check if document "1" exists by trying to PUT to it
       const response = await fetch(`${API_BASE}/1`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: newAlbums })
       });
+
+      // If PUT fails (404), it means the collection is empty, so we POST the first record
       if (!response.ok) {
         await fetch(API_BASE, {
           method: 'POST',
@@ -83,20 +114,24 @@ const App = () => {
         });
       }
     } catch (err) {
-      console.error("Sync failed", err);
+      console.error("Cloud sync failed:", err);
+    } finally {
+      dispatch({ type: 'SYNC_END' });
     }
   };
 
   const persistChanges = (newAlbums) => {
+    // Update UI immediately (Optimistic UI)
     dispatch({ type: 'SET_ITEMS', payload: newAlbums });
-    syncAlbums(newAlbums);
+    // Sync to MockAPI in the background
+    syncToBackend(newAlbums);
   };
 
   useEffect(() => {
     fetchAlbums();
   }, []);
 
-  // Navigation helpers
+  // --- NAVIGATION HELPERS ---
   const getCurrentDirectory = useCallback(() => {
     let current = albums;
     for (const id of currentPath) {
@@ -139,7 +174,18 @@ const App = () => {
     setShowAllNested(false);
   };
 
-  // --- RECURSIVE FOLDER PROCESSING FOR DRAG & DROP ---
+  // --- SIMULATED UPLOAD DELAY ---
+  const simulateUpload = async (name) => {
+    setUploadProgress({ active: true, percent: 0, fileName: name });
+    for (let i = 0; i <= 100; i += 20) {
+      setUploadProgress(prev => ({ ...prev, percent: i }));
+      await new Promise(r => setTimeout(r, 100));
+    }
+    await new Promise(r => setTimeout(r, 200));
+    setUploadProgress({ active: false, percent: 0, fileName: '' });
+  };
+
+  // --- RECURSIVE FOLDER PROCESSING ---
   const processEntry = async (entry, targetList) => {
     if (entry.isFile) {
       const file = await new Promise((resolve) => entry.file(resolve));
@@ -147,7 +193,7 @@ const App = () => {
         targetList.images.push({
           id: Math.random().toString(36).substr(2, 9),
           name: file.name,
-          url: URL.createObjectURL(file),
+          url: URL.createObjectURL(file), // Note: In a real app, you'd upload this to S3/Cloudinary and store the URL
           size: (file.size / 1024).toFixed(1) + ' KB'
         });
       }
@@ -173,10 +219,11 @@ const App = () => {
     const items = e.dataTransfer.items;
     if (!items) return;
 
-    const nextAlbums = JSON.parse(JSON.stringify(albums));
-    let targetNode = { subAlbums: nextAlbums, images: [] }; // Mock root node
+    await simulateUpload("Batch Uploading Folders...");
 
-    // If we are inside a folder, find the actual target node in the tree
+    const nextAlbums = JSON.parse(JSON.stringify(albums));
+    let targetNode = { subAlbums: nextAlbums, images: [] };
+
     if (currentPath.length > 0) {
       let current = nextAlbums;
       let found = null;
@@ -191,9 +238,7 @@ const App = () => {
       const item = items[i];
       if (item.kind === 'file') {
         const entry = item.webkitGetAsEntry();
-        if (entry) {
-          await processEntry(entry, targetNode);
-        }
+        if (entry) await processEntry(entry, targetNode);
       }
     }
 
@@ -245,9 +290,12 @@ const App = () => {
     persistChanges(deleteRecursive([...albums]));
   };
 
-  const handleFileUpload = (e) => {
+  const handleFileUpload = async (e) => {
     const files = e.target.files ? Array.from(e.target.files) : [];
     if (!files.length || currentPath.length === 0) return;
+
+    const fileNameLabel = files.length === 1 ? files[0].name : `${files.length} images`;
+    await simulateUpload(fileNameLabel);
 
     const newImages = files.map(file => ({
       id: Math.random().toString(36).substr(2, 9),
@@ -293,31 +341,21 @@ const App = () => {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') {
-        if (viewerIndex !== null) {
-          setViewerIndex(null);
-        } else if (isCreatingAlbum) {
-          setIsCreatingAlbum(false);
-          setNewAlbumName('');
-        }
+        if (viewerIndex !== null) setViewerIndex(null);
+        else if (isCreatingAlbum) { setIsCreatingAlbum(false); setNewAlbumName(''); }
       }
-
       if (viewerIndex !== null) {
-        if (e.key === 'ArrowRight') {
-          navigateViewer(1);
-        } else if (e.key === 'ArrowLeft') {
-          navigateViewer(-1);
-        } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (e.key === 'ArrowRight') navigateViewer(1);
+        else if (e.key === 'ArrowLeft') navigateViewer(-1);
+        else if (e.key === 'Delete' || e.key === 'Backspace') {
           const currentImageId = activePhotos[viewerIndex]?.id;
           if (currentImageId) {
             deleteImage(null, currentImageId);
-            if (activePhotos.length <= 1) {
-              setViewerIndex(null);
-            }
+            if (activePhotos.length <= 1) setViewerIndex(null);
           }
         }
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [viewerIndex, isCreatingAlbum, activePhotos, navigateViewer, deleteImage]);
@@ -327,8 +365,24 @@ const App = () => {
 
   if (status === 'loading' && albums.length === 0) {
     return (
-      <div className="fixed inset-0 flex items-center justify-center bg-slate-50">
-        <Loader2 className="w-8 h-8 text-blue-600 animate-spin" />
+      <div className="fixed inset-0 flex flex-col items-center justify-center bg-white">
+        <Loader2 className="w-10 h-10 text-blue-600 animate-spin mb-4" />
+        <p className="text-sm font-black text-slate-400 uppercase tracking-widest">Connecting to Cloud...</p>
+      </div>
+    );
+  }
+
+  if (status === 'failed') {
+    return (
+      <div className="fixed inset-0 flex flex-col items-center justify-center bg-white px-6 text-center">
+        <div className="bg-red-50 p-6 rounded-3xl mb-4 text-red-500">
+          <AlertCircle size={48} />
+        </div>
+        <h2 className="text-2xl font-black text-slate-800 mb-2">Backend Connection Failed</h2>
+        <p className="text-slate-500 max-w-sm mb-6">{error}</p>
+        <button onClick={fetchAlbums} className="bg-blue-600 text-white px-8 py-3 rounded-2xl font-bold shadow-xl shadow-blue-100">
+          Retry Connection
+        </button>
       </div>
     );
   }
@@ -340,16 +394,41 @@ const App = () => {
       onDragLeave={() => setIsDragging(false)}
       onDrop={handleDrop}
     >
+      {/* Cloud Sync Indicator */}
+      {syncing && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-white/90 backdrop-blur shadow-2xl border px-4 py-2 rounded-full flex items-center gap-2 animate-in fade-in slide-in-from-top-4">
+          <Loader2 size={12} className="text-blue-600 animate-spin" />
+          <span className="text-[10px] font-black uppercase tracking-tighter text-slate-600">Syncing to MockAPI</span>
+        </div>
+      )}
+
+      {/* Upload Progress Notification */}
+      {uploadProgress.active && (
+        <div className="fixed bottom-6 right-6 z-[60] w-80 bg-white rounded-2xl shadow-2xl border p-4 animate-in slide-in-from-bottom-4 duration-300">
+          <div className="flex items-center gap-3 mb-3">
+            <div className="p-2 bg-blue-100 rounded-lg">
+              <Upload size={18} className="text-blue-600 animate-pulse" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h4 className="text-xs font-black uppercase tracking-wider text-slate-800 truncate">Uploading...</h4>
+              <p className="text-[10px] text-slate-500 truncate font-medium">{uploadProgress.fileName}</p>
+            </div>
+            <span className="text-[10px] font-black text-blue-600">{uploadProgress.percent}%</span>
+          </div>
+          <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+            <div className="h-full bg-blue-600 transition-all duration-300 ease-out" style={{ width: `${uploadProgress.percent}%` }} />
+          </div>
+        </div>
+      )}
+
       {/* Global Drag Overlay */}
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-blue-600/90 backdrop-blur-sm flex items-center justify-center border-8 border-dashed border-white/50 m-4 rounded-3xl pointer-events-none animate-in zoom-in duration-200">
           <div className="flex flex-col items-center gap-6 text-white text-center">
-            <div className="bg-white/20 p-8 rounded-full">
-              <FileUp size={80} className="animate-bounce" />
-            </div>
+            <div className="bg-white/20 p-8 rounded-full"><FileUp size={80} className="animate-bounce" /></div>
             <div className="space-y-2">
-              <h3 className="text-4xl font-black">Drop to Upload</h3>
-              <p className="text-xl font-medium opacity-80">Folders and subfolders will be reconstructed automatically</p>
+              <h3 className="text-4xl font-black">Drop to Cloud</h3>
+              <p className="text-xl font-medium opacity-80">Syncing folders directly to backend storage</p>
             </div>
           </div>
         </div>
@@ -369,8 +448,7 @@ const App = () => {
               onClick={() => folderInputRef.current?.click()}
               className="bg-white border text-slate-600 hover:text-blue-600 px-3 py-2 rounded-full text-xs font-bold transition-all flex items-center gap-2 flex-shrink-0"
             >
-              <FolderUp size={14} />
-              <span>Bulk Upload</span>
+              <FolderUp size={14} /> <span>Bulk Upload</span>
             </button>
 
             {currentPath.length > 0 && (
@@ -381,15 +459,13 @@ const App = () => {
                     showAllNested ? 'bg-blue-100 text-blue-700 ring-2 ring-blue-500' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
                   }`}
                 >
-                  <Layers size={14} />
-                  <span>{showAllNested ? 'Deep View' : 'Folder View'}</span>
+                  <Layers size={14} /> <span>{showAllNested ? 'Deep View' : 'Folder View'}</span>
                 </button>
                 <button 
                   onClick={() => fileInputRef.current?.click()}
                   className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-full text-xs font-bold shadow-md flex items-center gap-2 flex-shrink-0"
                 >
-                  <Upload size={14} />
-                  <span>Add Pics</span>
+                  <Upload size={14} /> <span>Add Pics</span>
                 </button>
               </>
             )}
@@ -433,7 +509,7 @@ const App = () => {
                   </span>
                 </h2>
                 <p className="text-slate-400 text-[10px] font-black tracking-[0.2em] mt-1 uppercase">
-                  {showAllNested ? `${activePhotos.length} Total Items in Tree` : `${currentItems.length} Folders • ${(currentAlbum?.images || []).length} Photos`}
+                  {showAllNested ? `${activePhotos.length} Total Items` : `${currentItems.length} Folders • ${(currentAlbum?.images || []).length} Photos`}
                 </p>
               </div>
             </div>
@@ -450,16 +526,14 @@ const App = () => {
 
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4 sm:gap-6">
             {isCreatingAlbum && (
-              <div className="bg-white p-4 rounded-2xl border-2 border-dashed border-blue-400 flex flex-col gap-3 shadow-xl ring-4 ring-blue-50">
+              <div className="bg-white p-4 rounded-2xl border-2 border-dashed border-blue-400 flex flex-col gap-3 shadow-xl ring-4 ring-blue-50 animate-in zoom-in duration-200">
                 <input 
                   autoFocus
                   className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-blue-500 text-xs font-bold"
                   placeholder="Folder name..."
                   value={newAlbumName}
                   onChange={(e) => setNewAlbumName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') createAlbum();
-                  }}
+                  onKeyDown={(e) => e.key === 'Enter' && createAlbum()}
                 />
                 <div className="flex gap-2">
                   <button onClick={createAlbum} className="flex-1 bg-blue-600 text-white py-2 rounded-lg text-[10px] font-black uppercase">Create</button>
@@ -475,9 +549,7 @@ const App = () => {
                   {album.images?.[0] ? (
                     <img src={album.images[0].url} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
                   ) : (
-                    <div className="flex flex-col items-center gap-2 opacity-30">
-                      <Folder size={48} className="text-slate-400" />
-                    </div>
+                    <div className="flex flex-col items-center gap-2 opacity-30"><Folder size={48} className="text-slate-400" /></div>
                   )}
                   <div className="absolute inset-x-0 bottom-0 p-2 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
                     <p className="text-[9px] text-white font-black uppercase tracking-widest flex items-center gap-1">
@@ -490,17 +562,11 @@ const App = () => {
                   </button>
                 </div>
                 <div className="p-3 border-t bg-white">
-                  <div className="flex justify-between items-start gap-2">
-                    <h3 className="font-bold truncate text-slate-800 text-sm">{album.name}</h3>
-                  </div>
+                  <h3 className="font-bold truncate text-slate-800 text-sm">{album.name}</h3>
                   <div className="flex items-center gap-2 mt-1">
-                    <span className="text-[9px] text-blue-500 font-black uppercase tracking-tighter">
-                      {album.images?.length || 0} pics
-                    </span>
+                    <span className="text-[9px] text-blue-500 font-black uppercase tracking-tighter">{album.images?.length || 0} pics</span>
                     <span className="text-[9px] text-slate-300 font-black">•</span>
-                    <span className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">
-                      {album.subAlbums?.length || 0} folders
-                    </span>
+                    <span className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">{album.subAlbums?.length || 0} folders</span>
                   </div>
                 </div>
               </div>
@@ -536,7 +602,6 @@ const App = () => {
                 </div>
             )}
           </div>
-          
           <div className="h-20" />
         </div>
       </main>
@@ -553,14 +618,11 @@ const App = () => {
             </div>
             <button onClick={() => setViewerIndex(null)} className="p-3 bg-white/5 hover:bg-white/20 rounded-full transition-all ring-1 ring-white/10"><X size={28} /></button>
           </div>
-
           <button onClick={() => navigateViewer(-1)} className="absolute left-6 p-5 text-white bg-white/5 hover:bg-white/20 rounded-full hidden md:block transition-all"><ChevronLeft size={40} /></button>
           <button onClick={() => navigateViewer(1)} className="absolute right-6 p-5 text-white bg-white/5 hover:bg-white/20 rounded-full hidden md:block transition-all"><ChevronRight size={40} /></button>
-
           <div className="w-full max-h-[75vh] flex items-center justify-center p-4">
             <img src={activePhotos[viewerIndex].url} alt="" className="max-w-full max-h-full object-contain shadow-2xl rounded-sm" />
           </div>
-
           <div className="absolute bottom-8 w-full">
              <div className="flex justify-center gap-3 overflow-x-auto no-scrollbar py-4 px-10 max-w-4xl mx-auto">
               {activePhotos.map((img, idx) => (
@@ -568,10 +630,6 @@ const App = () => {
                      className={`h-16 w-16 flex-shrink-0 object-cover rounded-xl cursor-pointer transition-all duration-300 border-2 ${idx === viewerIndex ? 'border-blue-500 scale-125 ring-4 ring-blue-500/20 brightness-110 z-10' : 'border-transparent opacity-30 hover:opacity-100 hover:scale-110'}`} />
               ))}
             </div>
-          </div>
-          
-          <div className="absolute bottom-4 text-[10px] text-white/30 uppercase tracking-widest hidden md:block font-bold">
-            Left/Right to Nav • Esc to Close • Del to Delete
           </div>
         </div>
       )}
