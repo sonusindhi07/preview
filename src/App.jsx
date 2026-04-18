@@ -21,7 +21,7 @@ async function fetchWithRetry(url, options) {
 }
 
 async function callGemini(apiKey, systemInstruction, userPrompt, base64Data = null, mimeType = null) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`;
   
   const parts = [{ text: userPrompt }];
   if (base64Data && mimeType) {
