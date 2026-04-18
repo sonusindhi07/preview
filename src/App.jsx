@@ -1,7 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
 
 // ─── API & SYSTEM CONFIG ──────────────────────────────────────────────────
-const apiKey = ""; // Provided by execution environment
 
 // Exponential backoff fetcher (Enterprise stability)
 async function fetchWithRetry(url, options) {
@@ -21,7 +20,7 @@ async function fetchWithRetry(url, options) {
   }
 }
 
-async function callGemini(systemInstruction, userPrompt, base64Data = null, mimeType = null) {
+async function callGemini(apiKey, systemInstruction, userPrompt, base64Data = null, mimeType = null) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
   
   const parts = [{ text: userPrompt }];
@@ -135,6 +134,10 @@ function toBase64(file) {
 
 // ─── COMPONENT ───────────────────────────────────────────────────────────────
 export default function App() {
+  const [userApiKey, setUserApiKey] = useState(() => {
+    try { return localStorage.getItem("db_gemini_api_key") || ""; } catch { return ""; }
+  });
+  const [showSetup, setShowSetup] = useState(!userApiKey);
   const [mainTab, setMainTab] = useState("editor"); // 'editor' | 'whatsapp'
   
   // Editor State
@@ -162,6 +165,13 @@ export default function App() {
   const [selectedWa, setSelectedWa] = useState(null);
   const [waProcessing, setWaProcessing] = useState(false);
 
+  const handleSaveKey = () => {
+    if (userApiKey.trim()) {
+      try { localStorage.setItem("db_gemini_api_key", userApiKey.trim()); } catch (e) {}
+      setShowSetup(false);
+    }
+  };
+
   // Progress Bar Simulation Effect
   useEffect(() => {
     let interval;
@@ -187,7 +197,7 @@ export default function App() {
     if (article.trim().length < 20) { setApiError("Please write at least 20 characters."); return; }
     setLoading(true); setLoadingMsg("Analyzing Grammar & Facts…"); setApiError(null);
     try {
-      const parsed = await callGemini(ANALYSIS_PROMPT, `Analyse this news article:\n\n${article}`);
+      const parsed = await callGemini(userApiKey, ANALYSIS_PROMPT, `Analyse this news article:\n\n${article}`);
       setAnalysis(parsed);
       setSegments(buildSegments(article, parsed.errors || []));
       
@@ -197,7 +207,7 @@ export default function App() {
       
     } catch (e) { setApiError(`Error: ${e.message}`); }
     finally { setLoading(false); setLoadingMsg(""); }
-  }, [article]);
+  }, [article, userApiKey]);
 
   // ── Rewrite ──
   const rewrite = useCallback(async () => {
@@ -206,11 +216,11 @@ export default function App() {
     try {
       let instr = rwPrompt.trim() || "Rewrite in professional Dainik Bhaskar style.";
       if (storyLimit) instr += ` STRICT word limit: max ${storyLimit} words.`;
-      const parsed = await callGemini(REWRITE_PROMPT, `Instruction: ${instr}\n\nArticle:\n${article}`);
+      const parsed = await callGemini(userApiKey, REWRITE_PROMPT, `Instruction: ${instr}\n\nArticle:\n${article}`);
       setRwResult(parsed.rewritten || "");
     } catch (e) { setApiError(`Rewrite Error: ${e.message}`); }
     finally { setLoading(false); setLoadingMsg(""); }
-  }, [article, rwPrompt, storyLimit]);
+  }, [article, rwPrompt, storyLimit, userApiKey]);
 
   // ── Process Media (Pressnotes) ──
   const processMedia = useCallback(async (file) => {
@@ -223,10 +233,10 @@ export default function App() {
       let parsed;
       if (isImage || isPDF) {
         const b64 = await toBase64(file);
-        parsed = await callGemini(MEDIA_TO_NEWS_PROMPT, "Extract news and rewrite in Hindi.", b64, file.type);
+        parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, "Extract news and rewrite in Hindi.", b64, file.type);
       } else if (isText) {
         const text = await file.text();
-        parsed = await callGemini(MEDIA_TO_NEWS_PROMPT, `Extract news and rewrite in Hindi:\n\n${text}`);
+        parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, `Extract news and rewrite in Hindi:\n\n${text}`);
       } else {
         throw new Error("Unsupported file format.");
       }
@@ -235,7 +245,7 @@ export default function App() {
       setArticle(parsed.article); // Auto-fill editor
     } catch (e) { setApiError(`Media Error: ${e.message}`); }
     finally { setLoading(false); setLoadingMsg(""); }
-  }, []);
+  }, [userApiKey]);
 
   const handleFileInput = e => {
     const file = e.target.files[0];
@@ -261,7 +271,7 @@ export default function App() {
     if (msg.status === "new") {
       setWaProcessing(true);
       try {
-        const parsed = await callGemini(MEDIA_TO_NEWS_PROMPT, `WhatsApp Forward:\n\n${msg.content}`);
+        const parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, `WhatsApp Forward:\n\n${msg.content}`);
         const updatedMsgs = waMessages.map(m => m.id === msg.id ? { ...m, status: "processed", rewritten: parsed.article } : m);
         setWaMessages(updatedMsgs);
         setSelectedWa(updatedMsgs.find(m => m.id === msg.id));
@@ -280,6 +290,47 @@ export default function App() {
   const errCount = segments.filter(s => s.type === "error").length;
   const factCount = analysis?.fact_checks?.length || 0;
   const displayPairs = analysis?.pairs || [];
+
+  if (showSetup) {
+    return (
+      <div className="min-h-screen bg-[#0D1117] flex items-center justify-center p-6 text-[#E6EDF3] font-['Inter',sans-serif]">
+        <div className="card max-w-md w-full p-8 shadow-2xl border border-[#30363D]">
+          <div className="flex justify-center mb-6 text-5xl">📰</div>
+          <h1 className="text-2xl font-bold text-center mb-2">Welcome to DB NewsDesk</h1>
+          <p className="text-sm text-[#8B949E] text-center mb-8">AI Reporter Suite powered by Google Gemini.</p>
+          
+          <div className="mb-6">
+            <label className="lbl block mb-2">Google Gemini API Key</label>
+            <input 
+              type="password" 
+              value={userApiKey} 
+              onChange={e => setUserApiKey(e.target.value)}
+              placeholder="AIzaSy..." 
+              className="w-full bg-[#0D1117] border border-[#30363D] rounded-md px-4 py-3 text-sm text-white focus:border-[#C8102E] outline-none transition-colors"
+            />
+          </div>
+          
+          <button 
+            onClick={handleSaveKey}
+            disabled={!userApiKey.trim()}
+            className="w-full btn-red justify-center py-3 text-sm mb-6"
+          >
+            Access NewsDesk
+          </button>
+
+          <div className="bg-[#1C2128] border border-[#21262D] rounded p-4 text-xs text-[#8B949E] leading-relaxed">
+            <span className="font-bold text-[#C9D1D9]">How to get an API key:</span>
+            <ol className="list-decimal ml-4 mt-2 space-y-1">
+              <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-[#58A6FF] hover:underline">Google AI Studio</a></li>
+              <li>Sign in with your Google Account</li>
+              <li>Click "Create API Key" and copy it here</li>
+            </ol>
+            <p className="mt-3 text-[#6E7681]">Your key is stored securely in your browser's local storage and is only used to communicate directly with Google's API.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#0D1117] text-[#E6EDF3] font-['Inter',sans-serif]">
@@ -315,19 +366,20 @@ export default function App() {
             </div>
             
             <div className="ml-6 flex space-x-2">
-              <button className={`px-4 py-1 text-xs font-bold rounded-full ${mainTab === 'editor' ? 'bg-[#C8102E] text-white' : 'bg-transparent text-[#8B949E] hover:bg-[#21262D]'}`} onClick={() => setMainTab('editor')}>🖋️ AI Editor</button>
-              <button className={`px-4 py-1 text-xs font-bold rounded-full flex items-center gap-2 ${mainTab === 'whatsapp' ? 'bg-[#25D366] text-black' : 'bg-transparent text-[#8B949E] hover:bg-[#21262D]'}`} onClick={() => setMainTab('whatsapp')}>
-                💬 WhatsApp Inbox
-                {waMessages.filter(m=>m.status==='new').length > 0 && <span className="bg-red-500 text-white text-[9px] px-1.5 py-0.5 rounded-full">{waMessages.filter(m=>m.status==='new').length}</span>}
-              </button>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            <button className="btn-g text-xs py-1" onClick={clearAll}>Reset Canvas</button>
+            <button className={`px-4 py-1 text-xs font-bold rounded-full ${mainTab === 'editor' ? 'bg-[#C8102E] text-white' : 'bg-transparent text-[#8B949E] hover:bg-[#21262D]'}`} onClick={() => setMainTab('editor')}>🖋️ AI Editor</button>
+            <button className={`px-4 py-1 text-xs font-bold rounded-full flex items-center gap-2 ${mainTab === 'whatsapp' ? 'bg-[#25D366] text-black' : 'bg-transparent text-[#8B949E] hover:bg-[#21262D]'}`} onClick={() => setMainTab('whatsapp')}>
+              💬 WhatsApp Inbox
+              {waMessages.filter(m=>m.status==='new').length > 0 && <span className="bg-red-500 text-white text-[9px] px-1.5 py-0.5 rounded-full">{waMessages.filter(m=>m.status==='new').length}</span>}
+            </button>
           </div>
         </div>
-        
-        {/* Global Progress Bar */}
+        <div className="flex items-center gap-3">
+          <button className="btn-g text-xs py-1" onClick={() => setShowSetup(true)}>⚙️ API Key</button>
+          <button className="btn-g text-xs py-1" onClick={clearAll}>Reset Canvas</button>
+        </div>
+      </div>
+      
+      {/* Global Progress Bar */}
         <div className="absolute bottom-0 left-0 w-full h-[2px] bg-[#0D1117]">
             <div className="progress-bar" style={{ width: `${progress}%`, opacity: progress > 0 && progress < 100 ? 1 : 0 }} />
         </div>
