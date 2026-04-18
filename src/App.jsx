@@ -270,6 +270,8 @@ export default function App() {
     setSelectedWa(msg);
     if (msg.status === "new") {
       setWaProcessing(true);
+      setLoading(true);
+      setLoadingMsg("Processing WhatsApp...");
       try {
         const parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, `WhatsApp Forward:\n\n${msg.content}`);
         const updatedMsgs = waMessages.map(m => m.id === msg.id ? { ...m, status: "processed", rewritten: parsed.article } : m);
@@ -279,6 +281,7 @@ export default function App() {
         alert("Failed to process WhatsApp message: " + e.message);
       } finally {
         setWaProcessing(false);
+        setLoading(false);
       }
     }
   };
@@ -411,7 +414,7 @@ export default function App() {
                 <button className="btn-red" onClick={analyse} disabled={loading || !article.trim()}>
                   {loading ? (
                     <><svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                    {loadingMsg || "Analyzing..."}</>
+                    {loadingMsg || "Analyzing..."} {Math.round(progress)}%</>
                   ) : "⚡ Analyze Story"}
                 </button>
               </div>
@@ -536,7 +539,9 @@ export default function App() {
                         <label className="lbl block mb-2">Special Instructions for Rewrite</label>
                         <textarea className="w-full bg-[#161B22] border border-[#30363D] rounded-md p-3 text-sm text-white focus:border-[#58A6FF] outline-none" rows="2" placeholder="e.g. Focus on the emotional angle, make it suitable for front page..." value={rwPrompt} onChange={e=>setRwPrompt(e.target.value)} />
                       </div>
-                      <button className="btn-red mb-6" onClick={rewrite} disabled={loading}>✍ Generate Fresh Rewrite</button>
+                      <button className="btn-red mb-6" onClick={rewrite} disabled={loading}>
+                        {loading && loadingMsg === "Rewriting Story…" ? <><svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Rewriting... {Math.round(progress)}%</> : "✍ Generate Fresh Rewrite"}
+                      </button>
                       
                       {rwResult && (
                         <div className="bg-[#0D1117] border border-green-900/30 rounded-lg p-5">
@@ -639,7 +644,7 @@ export default function App() {
                       {waProcessing ? (
                         <div className="flex flex-col items-center justify-center h-40 gap-3">
                           <svg className="animate-spin h-6 w-6 text-[#25D366]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                          <span className="text-sm text-[#8B949E]">Converting to press format...</span>
+                          <span className="text-sm text-[#8B949E]">Converting to press format... {Math.round(progress)}%</span>
                         </div>
                       ) : selectedWa.status === "processed" ? (
                         <div className="bg-[#0D1117] p-5 rounded-lg border border-green-900/30 text-base text-[#E6EDF3] font-['Noto_Serif_Devanagari'] leading-loose whitespace-pre-wrap">
