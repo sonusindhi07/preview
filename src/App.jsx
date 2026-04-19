@@ -1,108 +1,97 @@
-import React, { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 
-// ─── API & SYSTEM CONFIG ──────────────────────────────────────────────────
-
-// Exponential backoff fetcher (Enterprise stability)
-async function fetchWithRetry(url, options) {
-  const delays = [1000, 2000, 4000, 8000, 16000];
-  for (let i = 0; i < 6; i++) {
-    try {
-      const res = await fetch(url, options);
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error?.message || `HTTP ${res.status}`);
-      }
-      return await res.json();
-    } catch (err) {
-      if (i === 5) throw err;
-      await new Promise(r => setTimeout(r, delays[i]));
-    }
-  }
-}
-
-async function callGemini(apiKey, systemInstruction, userPrompt, base64Data = null, mimeType = null) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${apiKey}`;
-  
-  const parts = [{ text: userPrompt }];
-  if (base64Data && mimeType) {
-    parts.push({ inlineData: { mimeType, data: base64Data } });
-  }
-
-  const payload = {
-    systemInstruction: { parts: [{ text: systemInstruction }] },
-    contents: [{ role: "user", parts }],
-    generationConfig: { responseMimeType: "application/json" }
-  };
-
-  const data = await fetchWithRetry(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("Invalid response from Gemini API");
-  
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    // Fallback if model wraps in markdown despite JSON config
-    let s = text.replace(/```json|```/gi, "").trim();
-    return JSON.parse(s);
-  }
-}
-
-// ─── DB EDITORIAL STYLE (shared) ──────────────────────────────────────────
-const DB_STYLE = `
-DAINIK BHASKAR EDITORIAL STYLE (MANDATORY):
-1. LEAD: Answer कौन/क्या/कहाँ/कब/क्यों in first 2-3 lines. Most important fact FIRST.
-2. LANGUAGE: Simple Khari Boli Hindi. Short sentences ≤20 words. Active voice.
-3. TONE: Authoritative, accessible, never sensational. Facts-first.
+// ─── DB STYLE ────────────────────────────────────────────────────────────────
+const DB_STYLE = `DAINIK BHASKAR EDITORIAL STYLE (MANDATORY):
+1. LEAD: Answer कौन/क्या/कहाँ/कब/क्यों in first 2-3 lines. Most important fact FIRST (inverted pyramid).
+2. LANGUAGE: Simple Khari Boli Hindi. Short sentences ≤20 words. Active voice. No heavy Sanskrit/Urdu jargon.
+3. TONE: Authoritative, accessible, never sensational. Facts-first. No opinion unless attributed.
 4. STRUCTURE: Lead → Key facts → Background → Quote → Impact/What next.
 5. NUMBERS: Always digits (5 not पाँच). ₹ symbol. % for percentages.
-6. ATTRIBUTION: Every claim needs source — "पुलिस के अनुसार".
+6. ATTRIBUTION: Every claim needs source — "पुलिस के अनुसार", "अधिकारियों ने बताया".
 7. QUOTES: Direct quotes from named sources only. In quotation marks.
-8. AVOID: Redundancy, passive voice, vague phrases.`;
+8. LOCAL CONNECT: Make story relevant to reader's daily life.
+9. AVOID: Redundancy, passive voice, vague phrases ("कुछ लोग", unnamed "सूत्र").
+10. If facts are missing, write [FACT NEEDED] — never invent.`;
 
-// ─── PROMPTS ───────────────────────────────────────────────────────────────
+// ─── PROMPTS ─────────────────────────────────────────────────────────────────
+const ANALYSIS_PROMPT = `You are an expert Hindi language editor for Dainik Bhaskar newspaper.
 
-const ANALYSIS_PROMPT = `You are an expert Hindi language editor and fact-checker for Dainik Bhaskar.
-CRITICAL TASK: Check for FACTUAL INCONSISTENCIES. Look for mismatched numbers (e.g., headline says 10000, body says 100), mismatched names, or illogical timelines.
+FONT-ENCODING RULES (STRICT — never flag these):
+- अा vs आ, ाे/ाै vs ो/ौ, िव vs वि, मंे vs में — same word, different encoding. IGNORE completely.
+- Only flag genuine grammar or wrong-letter spelling mistakes. When in doubt, do NOT flag.
 
-Respond ONLY with a valid JSON object matching this schema exactly:
+CONSISTENCY CHECK — CRITICAL:
+Also check for factual consistency between headline/subheadline and body text:
+- Numbers in headline vs body (e.g. headline says 10000 but body says 100 → flag it)
+- Names in headline vs body (e.g. headline says "राम" but body says "श्याम" → flag it)
+- Dates, amounts, percentages that differ between headline and content
+- Any factual contradiction between title and story body
+Report these as type "consistency" errors.
+
+Respond ONLY with a valid JSON object. No markdown, no backticks.
 {
-  "errors": [ { "original": "exact substring", "correction": "corrected text", "explanation": "grammar reason" } ],
-  "fact_checks": [ { "claim": "What is conflicting", "issue": "Why it's wrong/inconsistent", "suggestion": "How to fix" } ],
-  "pairs": [ { "headline": "Hindi headline", "subheadline": "sub-headline", "style": "breaking|informative|dramatic|soft|question|statistic", "angle": "one word", "score": 90 } ],
+  "errors": [ { "original": "exact substring or description", "correction": "corrected form", "explanation": "short reason", "type": "grammar|spelling|consistency" } ],
+  "pairs": [ { "headline": "Hindi headline", "subheadline": "matching sub-headline", "style": "breaking|informative|dramatic|soft|question|statistic", "angle": "one word", "score": 90 } ],
   "summary": "2-3 sentence editorial feedback in Hindi",
-  "seo_keywords": ["kw1","kw2"],
+  "seo_keywords": ["kw1","kw2","kw3"],
   "story_category": "politics|crime|sports|health|business|local|national|international|entertainment",
-  "missing_elements": ["missing journalistic element"]
+  "missing_elements": ["missing element description if any"]
 }
-Rules: Generate EXACTLY 5 headline pairs. Score 1-100.`;
+Rules: EXACTLY 20 pairs. Score 1-100. Escape double-quotes as \\". No trailing commas.`;
+
+const HEADLINES_PROMPT = `You are a senior Dainik Bhaskar headline writer.
+Generate exactly 20 headline+subheadline pairs. Enforce word limits if specified.
+Respond ONLY with valid JSON (no markdown):
+{ "pairs": [ { "headline": "Hindi headline", "subheadline": "Hindi sub-headline", "style": "breaking|informative|dramatic|soft|question|statistic", "angle": "one word", "score": 90 } ] }
+Score 1-100. Escape double-quotes as \\".`;
 
 const REWRITE_PROMPT = `You are a senior state editor at Dainik Bhaskar.
 ${DB_STYLE}
-Respond ONLY with valid JSON schema: { "rewritten": "full DB-style Hindi article" }`;
+If word count is specified, stay within that limit strictly.
+Respond ONLY with valid JSON (no markdown): { "rewritten": "full DB-style Hindi article" }
+Escape double-quotes as \\".`;
 
-const MEDIA_TO_NEWS_PROMPT = `You are a senior reporter at Dainik Bhaskar newspaper.
+const MEDIA_TO_NEWS_PROMPT = `You are a senior reporter at Dainik Bhaskar.
 ${DB_STYLE}
-Task: Extract factual info from the content, translate if English, and write a DB-style Hindi news article.
-Ensure facts (numbers, names) are strictly accurate and consistent.
-
-Respond ONLY with valid JSON schema:
+Extract all factual information from the provided content (press note / image / document).
+If content is in English, translate and rewrite in Hindi.
+Generate a full DB-style Hindi news article AND 5 headline+subheadline pairs.
+Respond ONLY with valid JSON (no markdown):
 {
   "article": "complete Hindi news article",
-  "pairs": [ { "headline": "Hindi headline", "subheadline": "Hindi sub-headline", "style": "informative", "score": 90 } ],
-  "summary": "brief note about the source",
-  "detected_language": "Hindi|English|Mixed"
-}`;
+  "pairs": [ { "headline": "Hindi headline", "subheadline": "Hindi sub-headline", "style": "breaking|informative|dramatic|soft|question|statistic", "score": 90 } ],
+  "summary": "brief note about source in English",
+  "detected_language": "Hindi|English|Mixed|Other",
+  "key_facts": ["fact1","fact2","fact3"]
+}
+Escape double-quotes as \\". No trailing commas.`;
 
-// ─── HELPERS ───────────────────────────────────────────────────────────────
+const PRESSNOTE_PROMPT = `You are a senior reporter at Dainik Bhaskar.
+${DB_STYLE}
+You have received a raw press note or forwarded WhatsApp message (may be in Hindi or English or mixed).
+Your tasks:
+1. Identify ALL key facts, names, numbers, dates, locations from the source.
+2. Write a complete professional DB-style Hindi news article.
+3. Generate 5 headline+subheadline pairs.
+4. List any facts that need verification.
+
+Respond ONLY with valid JSON (no markdown):
+{
+  "article": "complete DB-style Hindi news article",
+  "pairs": [ { "headline": "Hindi headline", "subheadline": "Hindi sub-headline", "style": "breaking|informative|dramatic|soft|question|statistic", "score": 90 } ],
+  "key_facts": ["fact1","fact2"],
+  "verify_needed": ["item that needs verification"],
+  "source_type": "press_note|whatsapp|email|other",
+  "detected_language": "Hindi|English|Mixed"
+}
+Escape double-quotes as \\". No trailing commas.`;
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 function buildSegments(text, errors) {
   if (!errors || errors.length === 0) return [{ type: "normal", text }];
   const positioned = [], used = [];
   for (const err of errors) {
+    if (!err.original) continue;
     const idx = text.indexOf(err.original);
     if (idx === -1) continue;
     if (used.some(([s, e]) => idx < e && idx + err.original.length > s)) continue;
@@ -120,6 +109,46 @@ function buildSegments(text, errors) {
   return segs;
 }
 
+function extractJSON(raw) {
+  let s = raw.replace(/```json|```/gi, "").trim();
+  try { return JSON.parse(s); } catch (_) {}
+  const st = s.indexOf("{"), en = s.lastIndexOf("}");
+  if (st !== -1 && en !== -1) { try { return JSON.parse(s.slice(st, en + 1)); } catch (_) {} }
+  return null;
+}
+
+// ─── GEMINI API CALL ─────────────────────────────────────────────────────────
+async function callGemini(apiKey, systemPrompt, userContent, imageParts = []) {
+  const model = "gemini-2.0-flash";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+  const parts = [];
+  if (imageParts.length > 0) parts.push(...imageParts);
+  parts.push({ text: userContent });
+
+  const body = {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: [{ role: "user", parts }],
+    generationConfig: { maxOutputTokens: 4096, temperature: 0.3 }
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    const msg = e?.error?.message || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  const raw = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+  const parsed = extractJSON(raw);
+  if (!parsed) throw new Error("Could not parse Gemini response. Please retry.");
+  return parsed;
+}
+
 const countWords = t => t.trim() ? t.trim().split(/\s+/).length : 0;
 const truncateWords = (t, n) => { const w = t.trim().split(/\s+/); return w.length <= n ? t : w.slice(0, n).join(" ") + "…"; };
 
@@ -132,533 +161,856 @@ function toBase64(file) {
   });
 }
 
-// ─── COMPONENT ───────────────────────────────────────────────────────────────
-export default function App() {
-  const [userApiKey, setUserApiKey] = useState(() => {
-    try { return localStorage.getItem("db_gemini_api_key") || ""; } catch { return ""; }
-  });
-  const [showSetup, setShowSetup] = useState(!userApiKey);
-  const [mainTab, setMainTab] = useState("editor"); // 'editor' | 'whatsapp'
-  
-  // Editor State
-  const [article, setArticle] = useState("");
-  const [analysis, setAnalysis] = useState(null);
-  const [segments, setSegments] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [loadingMsg, setLoadingMsg] = useState("");
-  const [progress, setProgress] = useState(0);
-  const [apiError, setApiError] = useState(null);
-  const [activeTab, setActiveTab] = useState("grammar");
-  const [storyLimit, setStoryLimit] = useState("");
+const STYLE_COLORS = {
+  breaking:"#EF4444", informative:"#3B82F6", dramatic:"#8B5CF6",
+  soft:"#10B981", question:"#F59E0B", statistic:"#06B6D4"
+};
+const CAT_COLORS = {
+  politics:"#EF4444", crime:"#F97316", sports:"#10B981", health:"#06B6D4",
+  business:"#3B82F6", local:"#8B5CF6", national:"#F59E0B", international:"#EC4899", entertainment:"#14B8A6"
+};
 
-  // Rewrite / Media State
-  const [rwOpen, setRwOpen] = useState(false);
-  const [rwPrompt, setRwPrompt] = useState("");
-  const [rwResult, setRwResult] = useState(null);
-  
-  const [mediaResult, setMediaResult] = useState(null);
-  const fileRef = useRef(null);
+const STEPS = [
+  { label: "Reading content", pct: 15 },
+  { label: "Checking grammar & consistency", pct: 35 },
+  { label: "Generating headlines", pct: 60 },
+  { label: "Analysing journalistic quality", pct: 80 },
+  { label: "Finalising", pct: 95 },
+];
 
-  // WhatsApp State
-  const [waNumberLinked, setWaNumberLinked] = useState("");
-  const [waMessages, setWaMessages] = useState([]);
-  const [selectedWa, setSelectedWa] = useState(null);
-  const [waProcessing, setWaProcessing] = useState(false);
+// ─── API KEY GATE ─────────────────────────────────────────────────────────────
+function ApiKeyGate({ onSave }) {
+  const [key, setKey] = useState("");
+  const [show, setShow] = useState(false);
+  const [err, setErr] = useState("");
+  const [testing, setTesting] = useState(false);
 
-  const handleSaveKey = () => {
-    if (userApiKey.trim()) {
-      try { localStorage.setItem("db_gemini_api_key", userApiKey.trim()); } catch (e) {}
-      setShowSetup(false);
-    }
+  const test = async () => {
+    if (!key.trim()) { setErr("Please enter your API key."); return; }
+    setTesting(true); setErr("");
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key.trim()}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with just: OK" }] }] })
+      });
+      if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || "Invalid API key"); }
+      onSave(key.trim());
+    } catch(e) { setErr(`❌ ${e.message}`); }
+    finally { setTesting(false); }
   };
 
-  // Progress Bar Simulation Effect
-  useEffect(() => {
-    let interval;
-    if (loading) {
-      setProgress(0);
-      interval = setInterval(() => {
-        setProgress(p => (p < 90 ? p + (90 - p) * 0.1 : p));
-      }, 300);
-    } else {
-      setProgress(100);
-      setTimeout(() => setProgress(0), 500); // Hide after complete
-    }
-    return () => clearInterval(interval);
-  }, [loading]);
+  return (
+    <div style={{ minHeight:"100vh", background:"#0D1117", display:"flex", alignItems:"center", justifyContent:"center", padding:24, fontFamily:"'Inter',sans-serif" }}>
+      <div style={{ maxWidth:520, width:"100%", animation:"fadeIn .4s ease" }}>
+        <div style={{ textAlign:"center", marginBottom:32 }}>
+          <div style={{ width:56, height:56, background:"linear-gradient(135deg,#C8102E,#8B0000)", borderRadius:14, display:"flex", alignItems:"center", justifyContent:"center", fontSize:26, margin:"0 auto 16px" }}>📰</div>
+          <div style={{ fontSize:22, fontWeight:800, color:"#E6EDF3", marginBottom:6 }}>Dainik Bhaskar NewsDesk</div>
+          <div style={{ fontSize:13, color:"#6E7681" }}>AI-Powered Reporter & Editor Suite</div>
+        </div>
+
+        <div style={{ background:"#161B22", border:"1px solid #21262D", borderRadius:12, padding:28 }}>
+          <div style={{ fontSize:14, fontWeight:700, color:"#E6EDF3", marginBottom:4 }}>Enter your Gemini API Key</div>
+          <div style={{ fontSize:12, color:"#6E7681", marginBottom:20, lineHeight:1.6 }}>
+            This app uses Google Gemini AI. Your key is stored only in your browser session and never sent to any server.
+          </div>
+
+          <div style={{ marginBottom:12 }}>
+            <div style={{ fontSize:11, color:"#6E7681", fontWeight:600, textTransform:"uppercase", letterSpacing:1, marginBottom:6 }}>Gemini API Key</div>
+            <div style={{ position:"relative" }}>
+              <input
+                type={show ? "text" : "password"}
+                value={key}
+                onChange={e => setKey(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && test()}
+                placeholder="AIza..."
+                style={{ width:"100%", background:"#0D1117", border:"1.5px solid #30363D", borderRadius:8, color:"#E6EDF3", fontSize:14, padding:"10px 44px 10px 14px", outline:"none", fontFamily:"monospace", transition:"border-color .2s" }}
+              />
+              <button onClick={()=>setShow(s=>!s)} style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", cursor:"pointer", fontSize:16, color:"#6E7681" }}>
+                {show ? "🙈" : "👁"}
+              </button>
+            </div>
+          </div>
+
+          {err && <div style={{ background:"#2D1117", border:"1px solid #7D2A2A", borderRadius:6, padding:"9px 12px", color:"#F87171", fontSize:13, marginBottom:12 }}>{err}</div>}
+
+          <button onClick={test} disabled={testing || !key.trim()} style={{ width:"100%", background:"linear-gradient(135deg,#C8102E,#E53E3E)", color:"#fff", border:"none", padding:"11px 0", borderRadius:8, fontSize:14, fontWeight:700, cursor:testing||!key.trim()?"not-allowed":"pointer", opacity:testing||!key.trim()?.4:1, fontFamily:"'Inter',sans-serif", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+            {testing ? <><div style={{ width:14, height:14, border:"2px solid rgba(255,255,255,.3)", borderTopColor:"#fff", borderRadius:"50%", animation:"spin .7s linear infinite" }} />Verifying…</> : "→ Connect & Enter NewsDesk"}
+          </button>
+
+          <div style={{ marginTop:20, background:"#0D1117", border:"1px solid #21262D", borderRadius:8, padding:"14px 16px" }}>
+            <div style={{ fontSize:11, fontWeight:700, color:"#6E7681", textTransform:"uppercase", letterSpacing:1, marginBottom:8 }}>How to get your API key</div>
+            {[
+              ["1", "Go to", "aistudio.google.com", "https://aistudio.google.com"],
+              ["2", "Sign in with your Google account", "", ""],
+              ["3", "Click 'Get API Key' → 'Create API key'", "", ""],
+              ["4", "Copy the key and paste it above", "", ""],
+            ].map(([n, text, link, href], i) => (
+              <div key={i} style={{ display:"flex", gap:8, marginBottom:6, fontSize:12, color:"#8B949E", alignItems:"flex-start" }}>
+                <span style={{ background:"#21262D", color:"#6E7681", borderRadius:"50%", width:18, height:18, display:"flex", alignItems:"center", justifyContent:"center", fontSize:10, fontWeight:700, flexShrink:0 }}>{n}</span>
+                <span>{text} {link && <a href={href} target="_blank" rel="noreferrer" style={{ color:"#388BFD", textDecoration:"none" }}>{link}</a>}</span>
+              </div>
+            ))}
+            <div style={{ marginTop:10, fontSize:11, color:"#484F58", lineHeight:1.5 }}>⚡ Free tier: 1500 requests/day · Gemini 2.0 Flash model · No credit card needed</div>
+          </div>
+        </div>
+      </div>
+      <style>{`@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+}
+
+// ─── PROGRESS BAR ────────────────────────────────────────────────────────────
+function ProgressBar({ progress, label }) {
+  return (
+    <div style={{ padding:"20px 0" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+        <span style={{ fontSize:13, color:"#8B949E", fontFamily:"'Inter',sans-serif" }}>{label}</span>
+        <span style={{ fontSize:12, color:"#58A6FF", fontWeight:700, fontFamily:"'Inter',sans-serif" }}>{progress}%</span>
+      </div>
+      <div style={{ height:6, background:"#21262D", borderRadius:3, overflow:"hidden" }}>
+        <div style={{ height:"100%", width:`${progress}%`, background:"linear-gradient(90deg,#C8102E,#E53E3E)", borderRadius:3, transition:"width .4s ease", boxShadow:"0 0 8px rgba(200,16,46,.5)" }} />
+      </div>
+      <div style={{ display:"flex", gap:6, marginTop:12, flexWrap:"wrap" }}>
+        {STEPS.map((s, i) => (
+          <div key={i} style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, fontFamily:"'Inter',sans-serif", color: progress >= s.pct ? "#4ADE80" : "#484F58" }}>
+            <span>{progress >= s.pct ? "✓" : "○"}</span>
+            <span>{s.label}</span>
+            {i < STEPS.length-1 && <span style={{ color:"#21262D", marginLeft:4 }}>·</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── PAIR CARD ────────────────────────────────────────────────────────────────
+function PairCard({ p, i, hlHeadLimit, hlSubLimit }) {
+  const sc = STYLE_COLORS[p.style] || "#30363D";
+  const scoreColor = p.score>=80?"#4ADE80":p.score>=60?"#FBBF24":"#F87171";
+  const scoreBg = p.score>=80?"linear-gradient(90deg,#238636,#4ADE80)":p.score>=60?"linear-gradient(90deg,#9A6700,#FBBF24)":"linear-gradient(90deg,#7D2A2A,#F87171)";
+  const headText = hlHeadLimit&&parseInt(hlHeadLimit)>0 ? truncateWords(p.headline,parseInt(hlHeadLimit)) : p.headline;
+  const subText  = hlSubLimit&&parseInt(hlSubLimit)>0   ? truncateWords(p.subheadline,parseInt(hlSubLimit)) : p.subheadline;
+  const copy = t => navigator.clipboard.writeText(t);
+  return (
+    <div style={{ background:"#0D1117", border:"1px solid #21262D", borderRadius:8, overflow:"hidden", marginBottom:10, transition:"border-color .15s" }}
+      onMouseEnter={e=>e.currentTarget.style.borderColor="#30363D"}
+      onMouseLeave={e=>e.currentTarget.style.borderColor="#21262D"}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 14px 6px", background:"#0A0E14" }}>
+        <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+          <span style={{ fontSize:11, color:"#484F58" }}>#{i+1}</span>
+          <span style={{ padding:"2px 7px", borderRadius:4, fontSize:10, fontWeight:700, color:"#fff", background:sc }}>{p.style||"standard"}</span>
+          {p.angle && <span style={{ fontSize:10, color:"#8B949E", background:"#21262D", borderRadius:4, padding:"2px 6px" }}>{p.angle}</span>}
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          <span style={{ fontSize:12, fontWeight:700, color:scoreColor }}>{p.score}</span>
+          <button onClick={()=>copy(p.headline+"\n"+p.subheadline)} style={{ background:"none", border:"1px solid #30363D", color:"#6E7681", padding:"2px 8px", borderRadius:4, fontSize:10, cursor:"pointer", fontFamily:"'Inter',sans-serif" }}>Copy Both</button>
+        </div>
+      </div>
+      <div style={{ padding:"10px 14px 8px", borderBottom:"1px solid #21262D" }}>
+        <div style={{ fontSize:10, color:"#6E7681", fontWeight:700, textTransform:"uppercase", letterSpacing:.8, marginBottom:5 }}>Headline</div>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+          <span style={{ fontSize:17, lineHeight:1.65, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", fontWeight:700 }}>{headText}</span>
+          <button onClick={()=>copy(p.headline)} style={{ background:"none", border:"1px solid #30363D", color:"#6E7681", padding:"2px 7px", borderRadius:4, fontSize:10, cursor:"pointer", flexShrink:0, fontFamily:"'Inter',sans-serif" }}>Copy</button>
+        </div>
+        <div style={{ height:3, background:"#21262D", borderRadius:2, marginTop:8, overflow:"hidden" }}>
+          <div style={{ height:"100%", width:`${p.score}%`, background:scoreBg, borderRadius:2, transition:"width .7s ease" }} />
+        </div>
+      </div>
+      <div style={{ padding:"8px 14px 12px", background:"#080C12" }}>
+        <div style={{ fontSize:10, color:"#484F58", fontWeight:700, textTransform:"uppercase", letterSpacing:.8, marginBottom:5 }}>Sub-Headline</div>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+          <span style={{ fontSize:14, lineHeight:1.75, color:"#8B949E", fontFamily:"'Noto Serif Devanagari',serif" }}>{subText}</span>
+          <button onClick={()=>copy(p.subheadline)} style={{ background:"none", border:"1px solid #30363D", color:"#6E7681", padding:"2px 7px", borderRadius:4, fontSize:10, cursor:"pointer", flexShrink:0, fontFamily:"'Inter',sans-serif" }}>Copy</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ────────────────────────────────────────────────────────────────
+export default function App() {
+  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem("db_gemini_key") || "");
+
+  const [article, setArticle]     = useState("");
+  const [analysis, setAnalysis]   = useState(null);
+  const [segments, setSegments]   = useState([]);
+  const [progress, setProgress]   = useState(0);
+  const [progressLabel, setProgressLabel] = useState("");
+  const [loading, setLoading]     = useState(false);
+  const [apiError, setApiError]   = useState(null);
+  const [activeTab, setActiveTab] = useState("grammar");
+
+  const [storyLimit, setStoryLimit] = useState("");
+
+  const [hlPrompt, setHlPrompt]       = useState("");
+  const [hlHeadLimit, setHlHeadLimit] = useState("");
+  const [hlSubLimit, setHlSubLimit]   = useState("");
+  const [hlLoading, setHlLoading]     = useState(false);
+  const [customPairs, setCustomPairs] = useState(null);
+
+  const [rwOpen, setRwOpen]         = useState(false);
+  const [rwPrompt, setRwPrompt]     = useState("");
+  const [rwLimit, setRwLimit]       = useState("");
+  const [rwLoading, setRwLoading]   = useState(false);
+  const [rwResult, setRwResult]     = useState(null);
+  const [rwDispLimit, setRwDispLimit] = useState("");
+
+  const [mediaLoading, setMediaLoading] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [mediaResult, setMediaResult]   = useState(null);
+
+  const [pressnote, setPressnote]       = useState("");
+  const [pressnoteLoading, setPressnoteLoading] = useState(false);
+  const [pressnoteResult, setPressnoteResult]   = useState(null);
+  const [pressnoteProgress, setPressnoteProgress] = useState(0);
+
+  const [transLoading, setTransLoading] = useState(false);
+
+  const [versions, setVersions] = useState([]);
+  const [showVersions, setShowVersions] = useState(false);
+
+  const editorRef = useRef(null);
+  const fileRef   = useRef(null);
+  const progressTimer = useRef(null);
+
+  const saveKey = k => { sessionStorage.setItem("db_gemini_key", k); setApiKey(k); };
+  const logout  = () => { sessionStorage.removeItem("db_gemini_key"); setApiKey(""); };
+
+  const saveVersion = useCallback((text, label) => {
+    if (!text.trim()) return;
+    setVersions(v => [...v.slice(-9), { text, label, time: new Date().toLocaleTimeString("en-IN") }]);
+  }, []);
+
+  const animateProgress = useCallback((from, to, durationMs, label) => {
+    setProgressLabel(label);
+    const steps = 20, stepTime = durationMs / steps;
+    let current = from, i = 0;
+    clearInterval(progressTimer.current);
+    progressTimer.current = setInterval(() => {
+      i++; current = from + ((to - from) * i / steps);
+      setProgress(Math.round(current));
+      if (i >= steps) clearInterval(progressTimer.current);
+    }, stepTime);
+  }, []);
 
   const clearAll = () => {
-    setArticle(""); setAnalysis(null); setSegments([]); setApiError(null);
-    setRwResult(null); setMediaResult(null); setRwOpen(false);
+    setArticle(""); setAnalysis(null); setSegments([]);
+    setCustomPairs(null); setRwResult(null); setMediaResult(null); setPressnoteResult(null);
+    setApiError(null); setStoryLimit(""); setHlPrompt(""); setHlHeadLimit(""); setHlSubLimit("");
+    setRwPrompt(""); setRwLimit(""); setRwDispLimit(""); setUploadedFile(null);
+    setRwOpen(false); setShowVersions(false); setProgress(0); setPressnote("");
   };
 
   // ── Analyse ──
   const analyse = useCallback(async () => {
     if (article.trim().length < 20) { setApiError("Please write at least 20 characters."); return; }
-    setLoading(true); setLoadingMsg("Analyzing Grammar & Facts…"); setApiError(null);
+    setLoading(true); setApiError(null); setAnalysis(null); setSegments([]); setCustomPairs(null); setRwResult(null);
+    setProgress(0);
     try {
-      const parsed = await callGemini(userApiKey, ANALYSIS_PROMPT, `Analyse this news article:\n\n${article}`);
+      animateProgress(0, 15, 600, "Reading story…");
+      await new Promise(r=>setTimeout(r,600));
+      animateProgress(15, 55, 1200, "Checking grammar & consistency…");
+      const parsed = await callGemini(apiKey, ANALYSIS_PROMPT, `Analyse this Hindi news article:\n\n${article}`);
+      animateProgress(55, 85, 600, "Generating headlines…");
+      await new Promise(r=>setTimeout(r,600));
+      animateProgress(85, 100, 400, "Done!");
+      await new Promise(r=>setTimeout(r,400));
       setAnalysis(parsed);
       setSegments(buildSegments(article, parsed.errors || []));
-      
-      // Auto-switch to fact checks if there are errors, otherwise grammar
-      if (parsed.fact_checks && parsed.fact_checks.length > 0) setActiveTab("facts");
-      else setActiveTab("grammar");
-      
+      setActiveTab("grammar");
     } catch (e) { setApiError(`Error: ${e.message}`); }
-    finally { setLoading(false); setLoadingMsg(""); }
-  }, [article, userApiKey]);
+    finally { setLoading(false); clearInterval(progressTimer.current); }
+  }, [article, apiKey, animateProgress]);
 
   // ── Rewrite ──
   const rewrite = useCallback(async () => {
     if (!article.trim()) return;
-    setLoading(true); setLoadingMsg("Rewriting Story…"); setApiError(null);
+    saveVersion(article, "Before rewrite");
+    setRwLoading(true); setApiError(null); setRwResult(null);
     try {
       let instr = rwPrompt.trim() || "Rewrite in professional Dainik Bhaskar style.";
-      if (storyLimit) instr += ` STRICT word limit: max ${storyLimit} words.`;
-      const parsed = await callGemini(userApiKey, REWRITE_PROMPT, `Instruction: ${instr}\n\nArticle:\n${article}`);
+      if (rwLimit) instr += ` STRICT word limit: max ${rwLimit} words.`;
+      const parsed = await callGemini(apiKey, REWRITE_PROMPT, `Article:\n\n${article}\n\nInstruction: ${instr}`);
       setRwResult(parsed.rewritten || "");
+      setRwDispLimit(rwLimit);
     } catch (e) { setApiError(`Rewrite Error: ${e.message}`); }
-    finally { setLoading(false); setLoadingMsg(""); }
-  }, [article, rwPrompt, storyLimit, userApiKey]);
+    finally { setRwLoading(false); }
+  }, [article, rwPrompt, rwLimit, apiKey, saveVersion]);
 
-  // ── Process Media (Pressnotes) ──
+  // ── Custom Headlines ──
+  const genHeadlines = useCallback(async () => {
+    if (!article.trim()) return;
+    setHlLoading(true); setApiError(null);
+    try {
+      let instr = hlPrompt.trim() || "Generate 20 best pairs.";
+      if (hlHeadLimit) instr += ` Each headline max ${hlHeadLimit} words.`;
+      if (hlSubLimit)  instr += ` Each sub-headline max ${hlSubLimit} words.`;
+      const parsed = await callGemini(apiKey, HEADLINES_PROMPT, `Article:\n\n${article}\n\nInstruction: ${instr}`);
+      setCustomPairs(parsed.pairs || []);
+    } catch (e) { setApiError(`Headlines Error: ${e.message}`); }
+    finally { setHlLoading(false); }
+  }, [article, hlPrompt, hlHeadLimit, hlSubLimit, apiKey]);
+
+  // ── Media upload ──
   const processMedia = useCallback(async (file) => {
-    setLoading(true); setLoadingMsg("Extracting News from Media…"); setApiError(null);
+    setMediaLoading(true); setApiError(null); setMediaResult(null); setUploadedFile(file);
     try {
       const isImage = file.type.startsWith("image/");
-      const isPDF = file.type === "application/pdf";
-      const isText = file.type.startsWith("text/") || file.name.endsWith(".txt");
-
-      let parsed;
-      if (isImage || isPDF) {
+      const isPDF   = file.type === "application/pdf";
+      let imageParts = [];
+      let userText = "";
+      if (isImage) {
         const b64 = await toBase64(file);
-        parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, "Extract news and rewrite in Hindi.", b64, file.type);
-      } else if (isText) {
-        const text = await file.text();
-        parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, `Extract news and rewrite in Hindi:\n\n${text}`);
+        imageParts = [{ inline_data: { mime_type: file.type, data: b64 } }];
+        userText = "Read all content from this image and generate a DB-style Hindi news article.";
+      } else if (isPDF) {
+        const b64 = await toBase64(file);
+        imageParts = [{ inline_data: { mime_type: "application/pdf", data: b64 } }];
+        userText = "Extract all content from this PDF and generate a DB-style Hindi news article.";
       } else {
-        throw new Error("Unsupported file format.");
+        const text = await file.text().catch(() => `[File: ${file.name}]`);
+        userText = `Extract news from this content and write a DB-style Hindi article:\n\nFilename: ${file.name}\n\n${text}`;
       }
-      
+      const parsed = await callGemini(apiKey, MEDIA_TO_NEWS_PROMPT, userText, imageParts);
       setMediaResult(parsed);
-      setArticle(parsed.article); // Auto-fill editor
     } catch (e) { setApiError(`Media Error: ${e.message}`); }
-    finally { setLoading(false); setLoadingMsg(""); }
-  }, [userApiKey]);
+    finally { setMediaLoading(false); }
+  }, [apiKey]);
 
-  const handleFileInput = e => {
-    const file = e.target.files[0];
-    if (file) processMedia(file);
-    e.target.value = null; // reset
-  };
+  // ── Translate → Hindi ──
+  const translateToHindi = useCallback(async () => {
+    if (!article.trim()) return;
+    setTransLoading(true); setApiError(null);
+    try {
+      const TRANS = `You are a professional Hindi translator at Dainik Bhaskar. Translate and rewrite as DB-style Hindi news. ${DB_STYLE} Respond ONLY with JSON: { "article": "DB-style Hindi article" } Escape double-quotes as \\".`;
+      const parsed = await callGemini(apiKey, TRANS, `Translate and rewrite:\n\n${article}`);
+      if (parsed.article) { saveVersion(article,"Before translation"); setArticle(parsed.article); }
+    } catch (e) { setApiError(`Translation Error: ${e.message}`); }
+    finally { setTransLoading(false); }
+  }, [article, apiKey, saveVersion]);
 
-  // ── WhatsApp Integration Sim ──
-  const simulateWhatsAppMsg = () => {
-    const dummyNews = `Police raid in Jaipur city today. 10000 liters of illegal alcohol seized from a warehouse in Mansarovar. 5 people arrested including main accused Ramesh. Inspector Sharma said the value is approx Rs 50 Lakhs. Operations started at 3 AM.`;
-    const newMsg = {
-      id: Date.now(),
-      sender: waNumberLinked || "+91 98765 43210",
-      time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }),
-      content: dummyNews,
-      status: "new"
-    };
-    setWaMessages([newMsg, ...waMessages]);
-  };
+  // ── Pressnote / WhatsApp → News ──
+  const processPressnote = useCallback(async () => {
+    if (!pressnote.trim()) return;
+    setPressnoteLoading(true); setApiError(null); setPressnoteResult(null);
+    setPressnoteProgress(0);
+    const timer = setInterval(() => setPressnoteProgress(p => Math.min(p + 8, 88)), 400);
+    try {
+      const parsed = await callGemini(apiKey, PRESSNOTE_PROMPT, `Process this press note / message:\n\n${pressnote}`);
+      setPressnoteResult(parsed);
+      setPressnoteProgress(100);
+    } catch (e) { setApiError(`Pressnote Error: ${e.message}`); }
+    finally { setPressnoteLoading(false); clearInterval(timer); }
+  }, [pressnote, apiKey]);
 
-  const openWaMessage = async (msg) => {
-    setSelectedWa(msg);
-    if (msg.status === "new") {
-      setWaProcessing(true);
-      setLoading(true);
-      setLoadingMsg("Processing WhatsApp...");
-      try {
-        const parsed = await callGemini(userApiKey, MEDIA_TO_NEWS_PROMPT, `WhatsApp Forward:\n\n${msg.content}`);
-        const updatedMsgs = waMessages.map(m => m.id === msg.id ? { ...m, status: "processed", rewritten: parsed.article } : m);
-        setWaMessages(updatedMsgs);
-        setSelectedWa(updatedMsgs.find(m => m.id === msg.id));
-      } catch (e) {
-        alert("Failed to process WhatsApp message: " + e.message);
-      } finally {
-        setWaProcessing(false);
-        setLoading(false);
-      }
-    }
-  };
+  const handleKeyDown = useCallback(e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") analyse();
+  }, [analyse]);
 
-  // Computed values
-  const words = countWords(article);
-  const overLimit = storyLimit && parseInt(storyLimit) > 0 && words > parseInt(storyLimit);
-  const hasErrors = segments.some(s => s.type === "error");
-  const errCount = segments.filter(s => s.type === "error").length;
-  const factCount = analysis?.fact_checks?.length || 0;
-  const displayPairs = analysis?.pairs || [];
+  const handleFileInput = e => { const f = e.target.files[0]; if (f) processMedia(f); };
+  const handleDrop = useCallback(e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f) processMedia(f);
+  }, [processMedia]);
 
-  if (showSetup) {
-    return (
-      <div className="min-h-screen bg-[#0D1117] flex items-center justify-center p-6 text-[#E6EDF3] font-['Inter',sans-serif]">
-        <div className="card max-w-md w-full p-8 shadow-2xl border border-[#30363D]">
-          <div className="flex justify-center mb-6 text-5xl">📰</div>
-          <h1 className="text-2xl font-bold text-center mb-2">Welcome to DB NewsDesk</h1>
-          <p className="text-sm text-[#8B949E] text-center mb-8">AI Reporter Suite powered by Google Gemini.</p>
-          
-          <div className="mb-6">
-            <label className="lbl block mb-2">Google Gemini API Key</label>
-            <input 
-              type="password" 
-              value={userApiKey} 
-              onChange={e => setUserApiKey(e.target.value)}
-              placeholder="AIzaSy..." 
-              className="w-full bg-[#0D1117] border border-[#30363D] rounded-md px-4 py-3 text-sm text-white focus:border-[#C8102E] outline-none transition-colors"
-            />
-          </div>
-          
-          <button 
-            onClick={handleSaveKey}
-            disabled={!userApiKey.trim()}
-            className="w-full btn-red justify-center py-3 text-sm mb-6"
-          >
-            Access NewsDesk
-          </button>
+  const words      = countWords(article);
+  const overLimit  = storyLimit && parseInt(storyLimit) > 0 && words > parseInt(storyLimit);
+  const hasErrors  = segments.some(s => s.type === "error");
+  const errCount   = segments.filter(s => s.type === "error").length;
+  const consistencyErrs = (analysis?.errors||[]).filter(e => e.type === "consistency");
+  const displayPairs  = customPairs || analysis?.pairs || [];
+  const limitedText   = storyLimit && parseInt(storyLimit) > 0 ? truncateWords(article, parseInt(storyLimit)) : article;
+  const limitedSegs   = storyLimit && parseInt(storyLimit) > 0 ? buildSegments(limitedText, analysis?.errors||[]) : segments;
+  const displayRw     = rwResult ? (rwDispLimit && parseInt(rwDispLimit) > 0 ? truncateWords(rwResult, parseInt(rwDispLimit)) : rwResult) : "";
 
-          <div className="bg-[#1C2128] border border-[#21262D] rounded p-4 text-xs text-[#8B949E] leading-relaxed">
-            <span className="font-bold text-[#C9D1D9]">How to get an API key:</span>
-            <ol className="list-decimal ml-4 mt-2 space-y-1">
-              <li>Go to <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-[#58A6FF] hover:underline">Google AI Studio</a></li>
-              <li>Sign in with your Google Account</li>
-              <li>Click "Create API Key" and copy it here</li>
-            </ol>
-            <p className="mt-3 text-[#6E7681]">Your key is stored securely in your browser's local storage and is only used to communicate directly with Google's API.</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  if (!apiKey) return <ApiKeyGate onSave={saveKey} />;
+
+  const Spinner = ({ size=13 }) => <div style={{ width:size, height:size, border:`2px solid rgba(255,255,255,.2)`, borderTopColor:"#fff", borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }} />;
 
   return (
-    <div className="min-h-screen bg-[#0D1117] text-[#E6EDF3] font-['Inter',sans-serif]">
+    <div style={{ minHeight:"100vh", background:"#0D1117", color:"#E6EDF3", fontFamily:"'Inter',sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+Devanagari:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
-        .editor-inp { background:#161B22; border:1px solid #30363D; border-radius:8px; color:#E6EDF3; font-size:16px; line-height:2.1; padding:16px 18px; font-family:'Noto Serif Devanagari',serif; resize:vertical; outline:none; transition:all 0.2s; width:100%; }
-        .editor-inp:focus { border-color:#C8102E; box-shadow:0 0 0 2px rgba(200,16,46,0.1); }
-        .card { background:#161B22; border:1px solid #21262D; border-radius:10px; }
-        .lbl { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:1.2px; color:#6E7681; }
-        .btn-red { background:linear-gradient(135deg,#C8102E,#E53E3E); color:#fff; padding:8px 18px; border-radius:6px; font-size:12px; font-weight:700; cursor:pointer; transition:all 0.2s; display:inline-flex; align-items:center; gap:6px; border:none; }
-        .btn-red:hover:not(:disabled) { filter:brightness(1.15); transform:translateY(-1px); }
-        .btn-red:disabled { opacity:0.5; cursor:not-allowed; }
-        .btn-g { background:transparent; color:#8B949E; border:1px solid #30363D; padding:8px 14px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; transition:all 0.18s; display:inline-flex; align-items:center; gap:5px; }
-        .btn-g:hover:not(:disabled) { background:#21262D; border-color:#58A6FF; color:#58A6FF; }
-        .err-w { color:#FF6B6B; background:rgba(255,107,107,.12); border-bottom:2px solid #FF4444; border-radius:3px 3px 0 0; padding:0 2px; cursor:help; font-weight:600; }
-        .err-b { color:#484F58; font-size:.9em; }
-        .err-f { color:#4ADE80; background:rgba(74,222,128,.1); border-bottom:2px solid #22C55E; border-radius:3px 3px 0 0; padding:0 2px; font-weight:700; }
-        .tab { background:none; border:none; cursor:pointer; padding:12px 20px; font-size:12px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; color:#6E7681; border-bottom:2px solid transparent; transition:0.2s; }
-        .tab.active { color:#E6EDF3; border-bottom-color:#C8102E; background:#1C2128; }
-        .tab:hover:not(.active) { color:#C9D1D9; background:#161B22; }
-        .progress-bar { height:3px; background:#C8102E; transition:width 0.3s ease, opacity 0.3s ease; }
-        .wa-msg:hover { background: #21262D; cursor: pointer; }
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:#161B22}::-webkit-scrollbar-thumb{background:#30363D;border-radius:3px}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .tab{background:none;border:none;cursor:pointer;padding:10px 18px;font-family:'Inter',sans-serif;font-size:11px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;transition:all .2s;border-bottom:2px solid transparent;color:#6E7681;white-space:nowrap}
+        .tab.on{color:#E6EDF3;border-bottom-color:#C8102E;background:#1C2128}
+        .tab:hover:not(.on){color:#C9D1D9;background:#161B22}
+        .btn-r{background:linear-gradient(135deg,#C8102E,#E53E3E);color:#fff;border:none;padding:9px 20px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+        .btn-r:hover:not(:disabled){filter:brightness(1.12);transform:translateY(-1px);box-shadow:0 4px 14px rgba(200,16,46,.4)}
+        .btn-r:disabled{opacity:.38;cursor:not-allowed}
+        .btn-b{background:linear-gradient(135deg,#1F6FEB,#388BFD);color:#fff;border:none;padding:9px 20px;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;font-family:'Inter',sans-serif;transition:all .2s;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+        .btn-b:hover:not(:disabled){filter:brightness(1.12);transform:translateY(-1px)}
+        .btn-b:disabled{opacity:.38;cursor:not-allowed}
+        .btn-g{background:transparent;color:#8B949E;border:1px solid #30363D;padding:7px 14px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;transition:all .18s;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
+        .btn-g:hover:not(:disabled){background:#21262D;border-color:#58A6FF;color:#58A6FF}
+        .btn-g:disabled{opacity:.35;cursor:not-allowed}
+        .inp{background:#161B22;border:1.5px solid #30363D;border-radius:8px;color:#E6EDF3;font-size:16px;line-height:2.1;padding:14px 16px;font-family:'Noto Serif Devanagari',serif;resize:vertical;outline:none;transition:border-color .2s;width:100%}
+        .inp:focus{border-color:#C8102E;box-shadow:0 0 0 3px rgba(200,16,46,.08)}
+        .inp::placeholder{color:#3D444D}
+        .tinp{background:#161B22;border:1px solid #30363D;border-radius:6px;color:#E6EDF3;font-size:13px;line-height:1.6;padding:9px 13px;font-family:'Inter',sans-serif;resize:none;outline:none;transition:border-color .2s;width:100%}
+        .tinp:focus{border-color:#388BFD}.tinp::placeholder{color:#3D444D}
+        .ninp{background:#161B22;border:1px solid #30363D;border-radius:6px;color:#E6EDF3;font-size:12px;padding:7px 10px;outline:none;font-family:'Inter',sans-serif;width:80px;-moz-appearance:textfield;transition:border-color .2s}
+        .ninp:focus{border-color:#388BFD}.ninp::-webkit-inner-spin-button,.ninp::-webkit-outer-spin-button{-webkit-appearance:none}
+        .card{background:#161B22;border:1px solid #21262D;border-radius:10px}
+        .lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1.2px;color:#6E7681}
+        .err-w{color:#FF6B6B;background:rgba(255,107,107,.12);border-bottom:2px solid #FF4444;border-radius:3px 3px 0 0;padding:0 2px;cursor:help;font-weight:600}
+        .err-c{color:#FBBF24;background:rgba(251,191,36,.1);border-bottom:2px solid #F59E0B;border-radius:3px 3px 0 0;padding:0 2px;cursor:help;font-weight:600}
+        .err-b{color:#484F58;font-size:.9em}
+        .err-f{color:#4ADE80;background:rgba(74,222,128,.1);border-bottom:2px solid #22C55E;border-radius:3px 3px 0 0;padding:0 2px;font-weight:700}
+        .drop-z{border:2px dashed #30363D;border-radius:8px;padding:14px;text-align:center;cursor:pointer;transition:all .2s;background:#0D1117}
+        .drop-z:hover,.drop-z.over{border-color:#C8102E;background:rgba(200,16,46,.04)}
+        .rw-slide{background:#0D1117;border:1px solid #21262D;border-top:none;border-radius:0 0 10px 10px;animation:rwSlide .25s ease;overflow:hidden}
+        @keyframes rwSlide{from{opacity:0;max-height:0}to{opacity:1;max-height:1000px}}
+        .tag{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700}
       `}</style>
 
-      {/* ── HEADER NAVIGATION ── */}
-      <div className="bg-[#161B22] border-b border-[#21262D] px-6 sticky top-0 z-50">
-        <div className="max-w-5xl mx-auto h-14 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="w-8 h-8 bg-gradient-to-br from-[#C8102E] to-red-900 rounded flex items-center justify-center text-lg">📰</div>
+      {/* ── NAV ── */}
+      <div style={{ background:"#161B22", borderBottom:"1px solid #21262D", padding:"0 24px", position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ maxWidth:940, margin:"0 auto", height:52, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{ width:30, height:30, background:"linear-gradient(135deg,#C8102E,#8B0000)", borderRadius:7, display:"flex", alignItems:"center", justifyContent:"center", fontSize:15 }}>📰</div>
             <div>
-              <div className="font-extrabold text-sm text-[#E6EDF3] tracking-tight">Dainik Bhaskar NewsDesk</div>
-              <div className="text-[10px] text-[#484F58] tracking-widest uppercase">AI Reporter Suite</div>
+              <div style={{ fontWeight:800, fontSize:13, color:"#E6EDF3", letterSpacing:-.2 }}>Dainik Bhaskar NewsDesk</div>
+              <div style={{ fontSize:9, color:"#484F58", letterSpacing:.8, textTransform:"uppercase" }}>AI Reporter · Editor Suite · Gemini Powered</div>
             </div>
-            
-            <div className="ml-6 flex space-x-2">
-            <button className={`px-4 py-1 text-xs font-bold rounded-full ${mainTab === 'editor' ? 'bg-[#C8102E] text-white' : 'bg-transparent text-[#8B949E] hover:bg-[#21262D]'}`} onClick={() => setMainTab('editor')}>🖋️ AI Editor</button>
-            <button className={`px-4 py-1 text-xs font-bold rounded-full flex items-center gap-2 ${mainTab === 'whatsapp' ? 'bg-[#25D366] text-black' : 'bg-transparent text-[#8B949E] hover:bg-[#21262D]'}`} onClick={() => setMainTab('whatsapp')}>
-              💬 WhatsApp Inbox
-              {waMessages.filter(m=>m.status==='new').length > 0 && <span className="bg-red-500 text-white text-[9px] px-1.5 py-0.5 rounded-full">{waMessages.filter(m=>m.status==='new').length}</span>}
-            </button>
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            {analysis?.story_category && (
+              <span className="tag" style={{ background:(CAT_COLORS[analysis.story_category]||"#30363D")+"22", color:CAT_COLORS[analysis.story_category]||"#8B949E", border:`1px solid ${(CAT_COLORS[analysis.story_category]||"#30363D")}44` }}>
+                {analysis.story_category.toUpperCase()}
+              </span>
+            )}
+            <div style={{ display:"flex", alignItems:"center", gap:4, background:"#0D1117", border:`1px solid ${overLimit?"#7D2A2A":"#21262D"}`, borderRadius:20, padding:"3px 10px", fontSize:12 }}>
+              <span style={{ fontWeight:700, color:overLimit?"#F87171":"#E6EDF3" }}>{words}</span>
+              <span style={{ color:"#484F58" }}>w</span>
+              {storyLimit&&<><span style={{ color:"#30363D" }}>/</span><span style={{ color:"#484F58" }}>{storyLimit}</span></>}
+              {overLimit&&<span style={{ color:"#F87171", fontWeight:700, fontSize:10 }}>+{words-parseInt(storyLimit)}</span>}
+            </div>
+            {versions.length > 0 && (
+              <button className="btn-g" style={{ padding:"4px 9px", fontSize:11 }} onClick={()=>setShowVersions(v=>!v)}>🕒 {versions.length}</button>
+            )}
+            <button className="btn-g" style={{ padding:"4px 9px", fontSize:11 }} onClick={clearAll}>Clear</button>
+            <button className="btn-g" style={{ padding:"4px 9px", fontSize:11 }} onClick={logout}>🔑 Logout</button>
           </div>
         </div>
-        <div className="flex items-center gap-3">
-          <button className="btn-g text-xs py-1" onClick={() => setShowSetup(true)}>⚙️ API Key</button>
-          <button className="btn-g text-xs py-1" onClick={clearAll}>Reset Canvas</button>
-        </div>
-      </div>
-      
-      {/* Global Progress Bar */}
-        <div className="absolute bottom-0 left-0 w-full h-[2px] bg-[#0D1117]">
-            <div className="progress-bar" style={{ width: `${progress}%`, opacity: progress > 0 && progress < 100 ? 1 : 0 }} />
-        </div>
       </div>
 
-      <div className="max-w-5xl mx-auto py-6 px-6">
-        
-        {/* =======================================================================================
-            MAIN EDITOR VIEW
-            ======================================================================================= */}
-        {mainTab === 'editor' && (
-          <div className="space-y-4">
-            
-            {/* Toolbar above editor */}
-            <div className="flex justify-between items-end mb-2">
-              <div>
-                <span className="lbl text-[#E6EDF3]">Live Story Canvas</span>
-                <p className="text-xs text-[#6E7681] mt-1">Keep writing while AI works. Paste content or upload media.</p>
+      <div style={{ maxWidth:940, margin:"0 auto", padding:"18px 24px" }}>
+
+        {/* ── VERSION HISTORY ── */}
+        {showVersions && versions.length > 0 && (
+          <div className="card" style={{ marginBottom:14, overflow:"hidden", animation:"fadeIn .2s ease" }}>
+            <div style={{ padding:"9px 14px", borderBottom:"1px solid #21262D", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+              <span className="lbl">Version History</span>
+              <button className="btn-g" style={{ padding:"3px 8px", fontSize:10 }} onClick={()=>setShowVersions(false)}>✕</button>
+            </div>
+            {[...versions].reverse().map((v,i)=>(
+              <div key={i} style={{ padding:"8px 14px", borderBottom:"1px solid #21262D", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <div style={{ display:"flex", gap:10, fontSize:12 }}>
+                  <span style={{ color:"#484F58" }}>🕒 {v.time}</span>
+                  <span style={{ color:"#8B949E" }}>{v.label}</span>
+                  <span style={{ color:"#484F58" }}>— {countWords(v.text)} words</span>
+                </div>
+                <button className="btn-g" style={{ padding:"2px 9px", fontSize:10 }} onClick={()=>{setArticle(v.text); setShowVersions(false);}}>Restore</button>
               </div>
-              <div className="flex gap-2 items-center">
-                <input type="number" placeholder="Word limit" value={storyLimit} onChange={e=>setStoryLimit(e.target.value)} className="bg-[#161B22] border border-[#30363D] rounded px-3 py-1.5 text-xs text-white w-24 outline-none focus:border-[#58A6FF]" />
-                
-                {/* INLINE MEDIA UPLOAD */}
-                <input ref={fileRef} type="file" className="hidden" accept="image/*,.pdf,.txt,.doc,.docx" onChange={handleFileInput} />
-                <button className="btn-g" onClick={() => fileRef.current.click()}>
-                  📎 Upload Pressnote
-                </button>
+            ))}
+          </div>
+        )}
 
-                <button className="btn-red" onClick={analyse} disabled={loading || !article.trim()}>
-                  {loading ? (
-                    <><svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                    {loadingMsg || "Analyzing..."} {Math.round(progress)}%</>
-                  ) : "⚡ Analyze Story"}
+        {/* ── EDITOR CARD ── */}
+        <div className="card" style={{ marginBottom: rwOpen ? 0 : 14, borderRadius: rwOpen?"10px 10px 0 0":10 }}>
+          <div style={{ padding:"16px 18px 12px" }}>
+            {/* Top bar */}
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10, flexWrap:"wrap", gap:8 }}>
+              <span className="lbl">Story Editor</span>
+              <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                <span className="lbl" style={{ color:"#484F58" }}>Word Limit</span>
+                <input type="number" className="ninp" placeholder="e.g. 300" value={storyLimit} onChange={e=>setStoryLimit(e.target.value)} min="0" />
+                {/* Upload button inline */}
+                <input ref={fileRef} type="file" style={{ display:"none" }} accept="image/*,.pdf,.txt,.doc,.docx" onChange={handleFileInput} />
+                <button className="btn-g" style={{ fontSize:11, padding:"5px 10px" }}
+                  onClick={()=>fileRef.current.click()} disabled={mediaLoading}
+                  onDragOver={e=>{e.preventDefault();e.currentTarget.classList.add("over")}}
+                  onDragLeave={e=>e.currentTarget.classList.remove("over")}
+                  onDrop={e=>{e.preventDefault();e.currentTarget.classList.remove("over");const f=e.dataTransfer.files[0];if(f)processMedia(f);}}>
+                  {mediaLoading ? <><Spinner />Reading…</> : "📎 Upload"}
+                </button>
+                <button className="btn-g" style={{ fontSize:11, padding:"5px 10px" }} onClick={translateToHindi} disabled={transLoading||!article.trim()}>
+                  {transLoading ? <><Spinner />Translating…</> : "🌐 → Hindi"}
+                </button>
+                <button className="btn-g" style={{ fontSize:11, padding:"5px 10px", borderColor:rwOpen?"#C8102E":"#30363D", color:rwOpen?"#C8102E":"#8B949E" }} onClick={()=>setRwOpen(o=>!o)}>
+                  {rwOpen?"✕ Rewrite":"✍ Rewrite"}
                 </button>
               </div>
             </div>
 
-            {/* API Error Alert */}
-            {apiError && (
-              <div className="bg-red-900/30 border border-red-500 text-red-200 px-4 py-3 rounded text-sm mb-4">
-                ⚠ {apiError}
+            <textarea ref={editorRef} className="inp" style={{ minHeight:190 }} value={article} onChange={e=>setArticle(e.target.value)} onKeyDown={handleKeyDown} placeholder="यहाँ अपना समाचार लिखें... (Hindi or English)" spellCheck={false} />
+
+            {/* Media upload drop hint */}
+            {uploadedFile && !mediaLoading && (
+              <div style={{ marginTop:8, fontSize:11, color:"#484F58", display:"flex", alignItems:"center", gap:6 }}>
+                <span>📎</span><span>{uploadedFile.name}</span>
+                {mediaResult && <button className="btn-g" style={{ fontSize:10, padding:"2px 8px" }} onClick={()=>{setArticle(mediaResult.article||"");setMediaResult(null);setUploadedFile(null);}}>Use in Editor</button>}
               </div>
             )}
 
-            {/* Word Count Pill */}
-            <div className="absolute mt-2 mr-2 right-[20%] z-10 pointer-events-none">
-               <div className={`px-3 py-1 rounded-full text-xs font-bold border backdrop-blur-md ${overLimit ? 'bg-red-900/50 border-red-500 text-red-300' : 'bg-[#161B22]/80 border-[#30363D] text-[#8B949E]'}`}>
-                 {words} words {storyLimit ? `/ ${storyLimit}` : ''}
-               </div>
+            {apiError && (
+              <div style={{ marginTop:8, background:"#2D1117", border:"1px solid #7D2A2A", borderRadius:6, padding:"8px 12px", color:"#F87171", fontSize:12, lineHeight:1.5 }}>⚠ {apiError}</div>
+            )}
+
+            {/* Progress bar */}
+            {loading && <ProgressBar progress={progress} label={progressLabel} />}
+
+            <div style={{ marginTop:10, display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:8 }}>
+              <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
+                <span style={{ fontSize:11, color:"#484F58" }}>Ctrl+Enter to analyse</span>
+                {analysis?.seo_keywords?.slice(0,3).map((k,i)=>(
+                  <span key={i} className="tag" style={{ background:"#21262D", color:"#8B949E", fontSize:10 }}>{k}</span>
+                ))}
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <button className="btn-g" style={{ fontSize:11 }} onClick={()=>saveVersion(article,"Manual save")} disabled={!article.trim()}>💾 Save</button>
+                <button className="btn-r" onClick={analyse} disabled={loading||!article.trim()}>
+                  {loading ? <><Spinner />Analysing…</> : <>⚡ Analyse Story</>}
+                </button>
+              </div>
             </div>
+          </div>
+        </div>
 
-            {/* Text Editor */}
-            <textarea 
-              className="editor-inp min-h-[250px]" 
-              value={article} 
-              onChange={e => setArticle(e.target.value)} 
-              placeholder="यहाँ अपना समाचार लिखें... (Hindi or English — write your news story here)" 
-              spellCheck={false} 
-            />
-
-            {/* AI Results Section */}
-            {analysis && (
-              <div className="card mt-6 overflow-hidden animate-[fadeIn_0.3s_ease]">
-                <div className="flex border-b border-[#21262D] bg-[#0D1117] overflow-x-auto">
-                  <button className={`tab ${activeTab === 'grammar' ? 'active' : ''}`} onClick={() => setActiveTab('grammar')}>
-                    Grammar & Style {errCount > 0 && <span className="ml-2 bg-red-600 text-white px-1.5 py-0.5 rounded-full text-[10px]">{errCount}</span>}
-                  </button>
-                  <button className={`tab ${activeTab === 'facts' ? 'active' : ''}`} onClick={() => setActiveTab('facts')}>
-                    Fact Checks {factCount > 0 && <span className="ml-2 bg-yellow-600 text-white px-1.5 py-0.5 rounded-full text-[10px]">{factCount}</span>}
-                  </button>
-                  <button className={`tab ${activeTab === 'headlines' ? 'active' : ''}`} onClick={() => setActiveTab('headlines')}>
-                    Headlines
-                  </button>
-                  <button className={`tab ${activeTab === 'rewrite' ? 'active' : ''}`} onClick={() => setActiveTab('rewrite')}>
-                    Rewrite Module
-                  </button>
+        {/* ── REWRITE PANEL ── */}
+        {rwOpen && (
+          <div className="rw-slide" style={{ marginBottom:14 }}>
+            <div style={{ padding:"14px 18px" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:10, flexWrap:"wrap" }}>
+                <span className="lbl" style={{ color:"#C8102E" }}>Rewrite in DB Style</span>
+                <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                  <span style={{ fontSize:11, color:"#6E7681" }}>Max words</span>
+                  <input type="number" className="ninp" placeholder="e.g. 300" value={rwLimit} onChange={e=>setRwLimit(e.target.value)} min="0" />
                 </div>
-
-                <div className="p-6">
-                  {/* GRAMMAR TAB */}
-                  {activeTab === 'grammar' && (
-                    <div>
-                      {analysis.summary && (
-                        <div className="bg-[#0D1117] border-l-4 border-[#C8102E] p-4 mb-4 rounded-r-md">
-                          <div className="lbl text-[#C8102E] mb-2">Editorial Feedback</div>
-                          <p className="text-sm leading-relaxed text-[#C9D1D9] font-['Noto_Serif_Devanagari']">{analysis.summary}</p>
-                        </div>
-                      )}
-                      {!hasErrors ? (
-                         <div className="text-green-400 font-bold text-sm">✓ No grammatical errors found. Story conforms to Dainik Bhaskar style.</div>
-                      ) : (
-                         <div className="bg-[#0D1117] border border-[#21262D] rounded-lg p-5 text-base leading-loose font-['Noto_Serif_Devanagari'] text-[#E6EDF3] whitespace-pre-wrap">
-                          {segments.map((seg, i) => {
-                            if (seg.type === "normal") return <span key={i}>{seg.text}</span>;
-                            return (
-                              <span key={i} title={seg.explanation || ""} className="cursor-help">
-                                <span className="err-w">{seg.original}</span>
-                                <span className="err-b"> [</span><span className="err-f">{seg.correction}</span><span className="err-b">] </span>
-                              </span>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* FACTS TAB */}
-                  {activeTab === 'facts' && (
-                    <div>
-                       <div className="mb-4 text-sm text-[#8B949E]">
-                         AI verifies inconsistencies in your draft (e.g. "Headline says 10000, body says 100").
-                       </div>
-                       {factCount === 0 ? (
-                         <div className="text-green-400 font-bold text-sm p-4 border border-green-900/30 bg-green-900/10 rounded">✓ No factual inconsistencies or conflicting numbers detected.</div>
-                       ) : (
-                         <div className="space-y-3">
-                           {analysis.fact_checks.map((fact, i) => (
-                             <div key={i} className="bg-[#1C1917] border border-[#44403C] border-l-4 border-l-yellow-500 rounded p-4">
-                               <div className="flex items-start gap-3">
-                                 <div className="text-yellow-500 mt-1">⚠</div>
-                                 <div>
-                                    <div className="text-sm font-bold text-[#E6EDF3] mb-1">Conflict: {fact.claim}</div>
-                                    <div className="text-sm text-[#A8A29E] mb-2">Issue: {fact.issue}</div>
-                                    <div className="text-xs text-yellow-500 bg-yellow-900/20 inline-block px-2 py-1 rounded">Suggestion: {fact.suggestion}</div>
-                                 </div>
-                               </div>
-                             </div>
-                           ))}
-                         </div>
-                       )}
-                    </div>
-                  )}
-
-                  {/* HEADLINES TAB */}
-                  {activeTab === 'headlines' && (
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      {displayPairs.map((p, i) => (
-                        <div key={i} className="bg-[#0D1117] border border-[#21262D] rounded-lg p-4 hover:border-[#30363D] transition-colors">
-                          <div className="flex justify-between items-center mb-3">
-                            <span className="text-[10px] bg-[#21262D] text-[#8B949E] px-2 py-1 rounded uppercase font-bold">{p.style || "Standard"}</span>
-                            <span className={`text-xs font-bold ${p.score >= 80 ? 'text-green-400' : 'text-yellow-500'}`}>Score: {p.score}</span>
-                          </div>
-                          <h4 className="text-lg font-bold font-['Noto_Serif_Devanagari'] text-[#E6EDF3] mb-2 leading-snug">{p.headline}</h4>
-                          <p className="text-sm text-[#8B949E] font-['Noto_Serif_Devanagari'] leading-relaxed">{p.subheadline}</p>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* REWRITE TAB */}
-                  {activeTab === 'rewrite' && (
-                    <div className="max-w-2xl">
-                      <div className="mb-4">
-                        <label className="lbl block mb-2">Special Instructions for Rewrite</label>
-                        <textarea className="w-full bg-[#161B22] border border-[#30363D] rounded-md p-3 text-sm text-white focus:border-[#58A6FF] outline-none" rows="2" placeholder="e.g. Focus on the emotional angle, make it suitable for front page..." value={rwPrompt} onChange={e=>setRwPrompt(e.target.value)} />
-                      </div>
-                      <button className="btn-red mb-6" onClick={rewrite} disabled={loading}>
-                        {loading && loadingMsg === "Rewriting Story…" ? <><svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Rewriting... {Math.round(progress)}%</> : "✍ Generate Fresh Rewrite"}
-                      </button>
-                      
-                      {rwResult && (
-                        <div className="bg-[#0D1117] border border-green-900/30 rounded-lg p-5">
-                           <div className="flex justify-between items-center mb-3">
-                             <div className="text-xs font-bold text-green-400 uppercase tracking-widest">Rewritten Version</div>
-                             <button className="btn-g text-[10px] py-1 px-2" onClick={() => { setArticle(rwResult); setActiveTab('grammar'); }}>Use This Content ↑</button>
-                           </div>
-                           <p className="text-base font-['Noto_Serif_Devanagari'] text-[#E6EDF3] leading-loose whitespace-pre-wrap">{rwResult}</p>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
+              </div>
+              <textarea className="tinp" value={rwPrompt} onChange={e=>setRwPrompt(e.target.value)} placeholder="Instructions e.g. front-page style, add emotional angle, shorten for online…" rows={2} />
+              <div style={{ marginTop:10, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                <span style={{ fontSize:11, color:"#484F58" }}>Rewrites using Dainik Bhaskar editorial guidelines</span>
+                <button className="btn-b" onClick={rewrite} disabled={rwLoading||!article.trim()}>
+                  {rwLoading?<><Spinner/>Rewriting…</>:<>✍ Rewrite Story</>}
+                </button>
+              </div>
+            </div>
+            {rwResult && (
+              <div style={{ borderTop:"1px solid #21262D" }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"9px 18px", background:"#161B22", flexWrap:"wrap", gap:8 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                    <span style={{ fontSize:12, fontWeight:700, color:"#4ADE80", textTransform:"uppercase" }}>Rewritten</span>
+                    <span style={{ fontSize:12, color:"#484F58" }}>{countWords(rwResult)} words</span>
+                  </div>
+                  <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                    <span style={{ fontSize:11, color:"#6E7681" }}>Display limit</span>
+                    <input type="number" className="ninp" placeholder="words" value={rwDispLimit} onChange={e=>setRwDispLimit(e.target.value)} min="0" />
+                    <button className="btn-g" style={{ fontSize:11, padding:"4px 9px" }} onClick={()=>navigator.clipboard.writeText(rwResult)}>Copy</button>
+                    <button className="btn-g" style={{ fontSize:11, padding:"4px 9px" }} onClick={()=>{saveVersion(article,"Before use rewrite");setArticle(rwResult);setRwResult(null);setRwOpen(false);}}>Use ↑</button>
+                  </div>
                 </div>
+                <div style={{ padding:"16px 18px", fontSize:16, lineHeight:2.1, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", whiteSpace:"pre-wrap" }}>{displayRw}</div>
               </div>
             )}
           </div>
         )}
 
-
-        {/* =======================================================================================
-            WHATSAPP INBOX VIEW
-            ======================================================================================= */}
-        {mainTab === 'whatsapp' && (
-          <div className="h-[80vh] flex flex-col md:flex-row gap-6">
-            
-            {/* Sidebar Inbox */}
-            <div className="w-full md:w-1/3 flex flex-col gap-4">
-              <div className="card p-4">
-                <div className="lbl mb-2">Link WhatsApp Webhook</div>
-                <div className="flex gap-2">
-                  <input type="text" placeholder="Enter Phone No." value={waNumberLinked} onChange={e=>setWaNumberLinked(e.target.value)} className="flex-1 bg-[#0D1117] border border-[#30363D] rounded px-3 py-1.5 text-sm text-white outline-none" />
-                  <button className="bg-[#25D366] text-black font-bold text-xs px-3 rounded hover:bg-[#1DA851] transition">Link</button>
+        {/* ── PRESSNOTE / WHATSAPP TAB INPUT ── */}
+        <div className="card" style={{ marginBottom:14 }}>
+          <div style={{ padding:"12px 18px 10px", borderBottom:"1px solid #21262D", display:"flex", alignItems:"center", gap:10 }}>
+            <span style={{ fontSize:16 }}>📋</span>
+            <div>
+              <div className="lbl" style={{ color:"#C8102E" }}>Press Note / WhatsApp Paste</div>
+              <div style={{ fontSize:11, color:"#484F58" }}>Paste forwarded press note or WhatsApp message (Hindi or English) → get DB-style news</div>
+            </div>
+          </div>
+          <div style={{ padding:"12px 18px" }}>
+            <textarea className="tinp" style={{ minHeight:90, fontFamily:"'Noto Serif Devanagari',serif", fontSize:15 }} value={pressnote} onChange={e=>setPressnote(e.target.value)} placeholder="यहाँ प्रेस नोट या WhatsApp फॉरवर्ड पेस्ट करें… (Hindi / English)" />
+            {pressnoteLoading && (
+              <div style={{ marginTop:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
+                  <span style={{ fontSize:12, color:"#8B949E" }}>Generating DB-style news…</span>
+                  <span style={{ fontSize:12, color:"#C8102E", fontWeight:700 }}>{pressnoteProgress}%</span>
                 </div>
-                <div className="mt-4 pt-4 border-t border-[#21262D]">
-                  <button className="w-full btn-g text-center justify-center text-xs" onClick={simulateWhatsAppMsg}>
-                    🔄 Simulate Incoming Pressnote
-                  </button>
+                <div style={{ height:4, background:"#21262D", borderRadius:2, overflow:"hidden" }}>
+                  <div style={{ height:"100%", width:`${pressnoteProgress}%`, background:"linear-gradient(90deg,#C8102E,#E53E3E)", transition:"width .3s ease", borderRadius:2 }} />
                 </div>
               </div>
+            )}
+            <div style={{ marginTop:10, display:"flex", justifyContent:"flex-end" }}>
+              <button className="btn-r" onClick={processPressnote} disabled={pressnoteLoading||!pressnote.trim()}>
+                {pressnoteLoading?<><Spinner/>Processing…</>:<>📰 Generate News</>}
+              </button>
+            </div>
+          </div>
+        </div>
 
-              <div className="card flex-1 overflow-y-auto">
-                <div className="p-3 border-b border-[#21262D] sticky top-0 bg-[#161B22] font-bold text-sm text-[#E6EDF3]">Inbox ({waMessages.length})</div>
-                {waMessages.length === 0 ? (
-                  <div className="text-center p-8 text-[#484F58] text-xs">No pending messages. Link number or simulate.</div>
-                ) : (
-                  <div className="flex flex-col">
-                    {waMessages.map(msg => (
-                      <div key={msg.id} className={`wa-msg p-4 border-b border-[#21262D] ${selectedWa?.id === msg.id ? 'bg-[#21262D]' : ''}`} onClick={() => openWaMessage(msg)}>
-                        <div className="flex justify-between items-start mb-1">
-                          <span className="text-xs font-bold text-white">{msg.sender}</span>
-                          <span className="text-[10px] text-[#8B949E]">{msg.time}</span>
-                        </div>
-                        <div className="text-xs text-[#8B949E] line-clamp-2">{msg.content}</div>
-                        {msg.status === "new" && <span className="inline-block mt-2 bg-red-500 text-white text-[9px] px-1.5 py-0.5 rounded font-bold uppercase">Unprocessed</span>}
-                        {msg.status === "processed" && <span className="inline-block mt-2 bg-green-600 text-white text-[9px] px-1.5 py-0.5 rounded font-bold uppercase">Processed</span>}
-                      </div>
+        {/* Pressnote result */}
+        {pressnoteResult && !pressnoteLoading && (
+          <div className="card" style={{ marginBottom:14, overflow:"hidden", animation:"fadeIn .3s ease", borderTop:"2px solid #C8102E" }}>
+            <div style={{ padding:"10px 18px", borderBottom:"1px solid #21262D", display:"flex", justifyContent:"space-between", alignItems:"center", background:"#161B22", flexWrap:"wrap", gap:8 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                <span style={{ fontSize:12, fontWeight:700, color:"#C8102E", textTransform:"uppercase" }}>📋 Press Note → News</span>
+                {pressnoteResult.detected_language && <span className="tag" style={{ background:"#21262D", color:"#8B949E" }}>Source: {pressnoteResult.detected_language}</span>}
+                {pressnoteResult.source_type && <span className="tag" style={{ background:"#21262D", color:"#8B949E" }}>{pressnoteResult.source_type.replace("_"," ")}</span>}
+                <span style={{ fontSize:11, color:"#484F58" }}>{countWords(pressnoteResult.article||"")} words</span>
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <button className="btn-g" style={{ fontSize:11, padding:"4px 9px" }} onClick={()=>navigator.clipboard.writeText(pressnoteResult.article||"")}>Copy</button>
+                <button className="btn-g" style={{ fontSize:11, padding:"4px 9px" }} onClick={()=>{setArticle(pressnoteResult.article||"");setPressnoteResult(null);}}>Use in Editor ↑</button>
+              </div>
+            </div>
+
+            {/* Side-by-side comparison */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:0 }}>
+              <div style={{ padding:"16px 18px", borderRight:"1px solid #21262D" }}>
+                <div className="lbl" style={{ marginBottom:10, color:"#F87171" }}>Original / Source</div>
+                <div style={{ fontSize:14, lineHeight:1.85, color:"#8B949E", fontFamily:"'Noto Serif Devanagari',serif", whiteSpace:"pre-wrap", maxHeight:320, overflowY:"auto" }}>{pressnote}</div>
+              </div>
+              <div style={{ padding:"16px 18px" }}>
+                <div className="lbl" style={{ marginBottom:10, color:"#4ADE80" }}>DB-Style Rewrite</div>
+                <div style={{ fontSize:15, lineHeight:2.0, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", whiteSpace:"pre-wrap", maxHeight:320, overflowY:"auto" }}>{pressnoteResult.article}</div>
+              </div>
+            </div>
+
+            {/* Key facts & verify */}
+            {(pressnoteResult.key_facts?.length > 0 || pressnoteResult.verify_needed?.length > 0) && (
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", borderTop:"1px solid #21262D" }}>
+                {pressnoteResult.key_facts?.length > 0 && (
+                  <div style={{ padding:"12px 18px", borderRight:"1px solid #21262D" }}>
+                    <div className="lbl" style={{ marginBottom:8, color:"#4ADE80" }}>Key Facts Extracted</div>
+                    {pressnoteResult.key_facts.map((f,i)=>(
+                      <div key={i} style={{ fontSize:12, color:"#8B949E", marginBottom:5, paddingLeft:10, borderLeft:"2px solid #238636" }}>• {f}</div>
+                    ))}
+                  </div>
+                )}
+                {pressnoteResult.verify_needed?.length > 0 && (
+                  <div style={{ padding:"12px 18px" }}>
+                    <div className="lbl" style={{ marginBottom:8, color:"#FBBF24" }}>Needs Verification</div>
+                    {pressnoteResult.verify_needed.map((f,i)=>(
+                      <div key={i} style={{ fontSize:12, color:"#8B949E", marginBottom:5, paddingLeft:10, borderLeft:"2px solid #9A6700" }}>⚠ {f}</div>
                     ))}
                   </div>
                 )}
               </div>
+            )}
+
+            {/* Quick headlines from pressnote */}
+            {pressnoteResult.pairs?.length > 0 && (
+              <div style={{ padding:"12px 18px", borderTop:"1px solid #21262D" }}>
+                <div className="lbl" style={{ marginBottom:10 }}>Quick Headlines</div>
+                {pressnoteResult.pairs.map((p,i)=>(
+                  <div key={i} style={{ padding:"10px 12px", background:"#0D1117", border:"1px solid #21262D", borderRadius:6, marginBottom:8 }}>
+                    <div style={{ fontSize:15, fontWeight:700, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", marginBottom:5 }}>{p.headline}</div>
+                    <div style={{ fontSize:13, color:"#8B949E", fontFamily:"'Noto Serif Devanagari',serif" }}>{p.subheadline}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* WhatsApp integration info */}
+            <div style={{ padding:"10px 18px", borderTop:"1px solid #21262D", background:"#0D1117" }}>
+              <div style={{ display:"flex", alignItems:"flex-start", gap:8, fontSize:11, color:"#484F58", lineHeight:1.6 }}>
+                <span style={{ color:"#25D366", fontSize:14 }}>💬</span>
+                <span><span style={{ color:"#8B949E", fontWeight:600 }}>WhatsApp Integration:</span> To auto-receive messages here, set up a WhatsApp Business API webhook (Twilio / Meta Cloud API) that POSTs incoming messages to your backend. Your backend can then call this tool's API. <span style={{ color:"#388BFD" }}>Ask your tech team to configure the webhook URL.</span></span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Media result */}
+        {mediaResult && !mediaLoading && (
+          <div className="card" style={{ marginBottom:14, overflow:"hidden", animation:"fadeIn .3s ease", borderTop:"2px solid #3B82F6" }}>
+            <div style={{ padding:"10px 18px", borderBottom:"1px solid #21262D", display:"flex", justifyContent:"space-between", alignItems:"center", background:"#161B22", flexWrap:"wrap", gap:8 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <span style={{ fontSize:12, fontWeight:700, color:"#3B82F6", textTransform:"uppercase" }}>📎 File → News</span>
+                {mediaResult.detected_language && <span className="tag" style={{ background:"#21262D", color:"#8B949E" }}>{mediaResult.detected_language}</span>}
+                <span style={{ fontSize:11, color:"#484F58" }}>{countWords(mediaResult.article||"")} words</span>
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <button className="btn-g" style={{ fontSize:11, padding:"4px 9px" }} onClick={()=>navigator.clipboard.writeText(mediaResult.article||"")}>Copy</button>
+                <button className="btn-g" style={{ fontSize:11, padding:"4px 9px" }} onClick={()=>{setArticle(mediaResult.article||"");setMediaResult(null);setUploadedFile(null);}}>Use in Editor ↑</button>
+              </div>
+            </div>
+            <div style={{ padding:"16px 18px", fontSize:16, lineHeight:2.1, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", whiteSpace:"pre-wrap" }}>{mediaResult.article}</div>
+            {mediaResult.pairs?.length > 0 && (
+              <div style={{ padding:"0 18px 14px" }}>
+                <div style={{ height:1, background:"#21262D", margin:"0 0 12px" }} />
+                <div className="lbl" style={{ marginBottom:10 }}>Quick Headlines</div>
+                {mediaResult.pairs.map((p,i)=>(
+                  <div key={i} style={{ padding:"10px 12px", background:"#0D1117", border:"1px solid #21262D", borderRadius:6, marginBottom:7 }}>
+                    <div style={{ fontSize:15, fontWeight:700, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", marginBottom:4 }}>{p.headline}</div>
+                    <div style={{ fontSize:13, color:"#8B949E", fontFamily:"'Noto Serif Devanagari',serif" }}>{p.subheadline}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── RESULTS TABS ── */}
+        {analysis && !loading && (
+          <div className="card" style={{ overflow:"hidden", animation:"fadeIn .3s ease" }}>
+            <div style={{ display:"flex", borderBottom:"1px solid #21262D", background:"#0D1117", overflowX:"auto" }}>
+              {[
+                { k:"grammar", label:"Grammar Check", badge: errCount>0?errCount:null, bc:"#CF222E" },
+                { k:"consistency", label:"Consistency Check", badge: consistencyErrs.length>0?consistencyErrs.length:null, bc:"#F59E0B" },
+                { k:"headlines", label:"Headlines & Subheads", badge:displayPairs.length||null, bc:"#C8102E" },
+                ...(analysis.missing_elements?.length>0?[{ k:"missing", label:"Missing Elements", badge:analysis.missing_elements.length, bc:"#EF4444" }]:[]),
+              ].map(t=>(
+                <button key={t.k} className={`tab ${activeTab===t.k?"on":""}`} onClick={()=>setActiveTab(t.k)}>
+                  {t.label}
+                  {t.badge!=null&&<span style={{ background:activeTab===t.k?t.bc:"#21262D", color:activeTab===t.k?"#fff":"#6E7681", borderRadius:20, padding:"1px 6px", fontSize:10, marginLeft:5, fontWeight:700 }}>{t.badge}</span>}
+                </button>
+              ))}
             </div>
 
-            {/* Split Screen Content */}
-            <div className="w-full md:w-2/3 flex flex-col">
-              {!selectedWa ? (
-                <div className="card h-full flex flex-col items-center justify-center text-[#484F58]">
-                  <div className="text-4xl mb-4">📱</div>
-                  <div>Select a WhatsApp message to process</div>
-                </div>
-              ) : (
-                <div className="card flex-1 flex flex-col overflow-hidden">
-                  <div className="p-4 border-b border-[#21262D] bg-[#0D1117] flex justify-between items-center">
-                    <div>
-                      <span className="text-white font-bold text-sm mr-2">{selectedWa.sender}</span>
-                      <span className="text-xs text-[#8B949E]">{selectedWa.time}</span>
+            <div style={{ padding:"20px 22px" }}>
+
+              {/* GRAMMAR */}
+              {activeTab==="grammar" && (
+                <div style={{ animation:"fadeIn .25s ease" }}>
+                  {analysis.summary && (
+                    <div style={{ background:"#0D1117", border:"1px solid #21262D", borderLeft:"3px solid #C8102E", borderRadius:"0 8px 8px 0", padding:"12px 16px", marginBottom:16 }}>
+                      <div className="lbl" style={{ color:"#C8102E", marginBottom:6 }}>Editorial Feedback</div>
+                      <p style={{ fontSize:15, lineHeight:1.9, color:"#C9D1D9", fontFamily:"'Noto Serif Devanagari',serif" }}>{analysis.summary}</p>
                     </div>
-                    {selectedWa.status === "processed" && (
-                      <button className="btn-red text-[10px] py-1 px-3" onClick={() => {
-                        setArticle(selectedWa.rewritten);
-                        setMainTab('editor');
-                      }}>✏️ Move to Editor</button>
-                    )}
+                  )}
+                  {storyLimit&&parseInt(storyLimit)>0&&(
+                    <div style={{ marginBottom:14, background:"#161B22", border:"1px solid #21262D", borderRadius:6, padding:"7px 14px", display:"flex", alignItems:"center", gap:8, fontSize:12 }}>
+                      <span style={{ color:"#6E7681" }}>Word limit active:</span>
+                      <span style={{ color:"#58A6FF", fontWeight:700 }}>{storyLimit} words</span>
+                      {overLimit&&<span style={{ color:"#F87171", fontWeight:600, marginLeft:"auto" }}>⚠ {words-parseInt(storyLimit)} over</span>}
+                    </div>
+                  )}
+                  {hasErrors && (
+                    <div style={{ display:"flex", gap:12, marginBottom:12, alignItems:"center", flexWrap:"wrap" }}>
+                      <span className="lbl">Legend:</span>
+                      <span style={{ fontSize:13, fontFamily:"'Noto Serif Devanagari',serif" }}>
+                        <span className="err-w" style={{ cursor:"default" }}>गलत</span><span className="err-b"> [</span><span className="err-f">सही</span><span className="err-b">]</span>
+                      </span>
+                      <span style={{ fontSize:11, color:"#484F58" }}>Hover for reason</span>
+                    </div>
+                  )}
+                  {!hasErrors ? (
+                    <div>
+                      <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:10 }}>
+                        <span style={{ color:"#4ADE80" }}>✓</span>
+                        <span style={{ fontSize:13, color:"#4ADE80", fontWeight:600 }}>No grammar errors</span>
+                      </div>
+                      <div style={{ background:"#0D1117", border:"1px solid #21262D", borderRadius:8, padding:"16px 18px", fontSize:16, lineHeight:2.2, color:"#E6EDF3", fontFamily:"'Noto Serif Devanagari',serif", whiteSpace:"pre-wrap" }}>{limitedText}</div>
+                    </div>
+                  ) : (
+                    <div style={{ background:"#0D1117", border:"1px solid #21262D", borderRadius:8, padding:"16px 18px", fontSize:16, lineHeight:2.4, fontFamily:"'Noto Serif Devanagari',serif", color:"#E6EDF3", whiteSpace:"pre-wrap" }}>
+                      {limitedSegs.map((seg,i)=>{
+                        if(seg.type==="normal") return <span key={i}>{seg.text}</span>;
+                        const isConsistency = seg.type==="consistency";
+                        return (
+                          <span key={i} title={seg.explanation||""} style={{ cursor:"help" }}>
+                            <span className={isConsistency?"err-c":"err-w"}>{seg.original}</span>
+                            <span className="err-b"> [</span><span className="err-f">{seg.correction}</span><span className="err-b">] </span>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* CONSISTENCY */}
+              {activeTab==="consistency" && (
+                <div style={{ animation:"fadeIn .25s ease" }}>
+                  <div style={{ marginBottom:14, fontSize:13, color:"#8B949E", lineHeight:1.6 }}>
+                    These are factual inconsistencies between your <span style={{ color:"#FBBF24" }}>headline/subheadline</span> and the <span style={{ color:"#E6EDF3" }}>story body</span> — numbers, names, dates that don't match.
                   </div>
-                  
-                  <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
-                    {/* Left: Original WhatsApp */}
-                    <div className="w-full md:w-1/2 p-4 md:border-r border-[#21262D] overflow-y-auto bg-[#1C2128]">
-                      <div className="lbl mb-4 text-[#8B949E]">Original WhatsApp Forward</div>
-                      <div className="bg-[#0D1117] p-4 rounded-lg border border-[#30363D] text-sm text-[#C9D1D9] whitespace-pre-wrap leading-relaxed relative">
-                        <div className="absolute top-2 right-2 opacity-20 text-2xl">💬</div>
-                        {selectedWa.content}
+                  {consistencyErrs.length === 0 ? (
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      <span style={{ color:"#4ADE80", fontSize:16 }}>✓</span>
+                      <span style={{ fontSize:13, color:"#4ADE80", fontWeight:600 }}>No consistency issues found. Headlines match the story.</span>
+                    </div>
+                  ) : consistencyErrs.map((e,i)=>(
+                    <div key={i} style={{ padding:"12px 14px", background:"#0D1117", border:"1px solid #9A6700", borderLeft:"4px solid #FBBF24", borderRadius:"0 8px 8px 0", marginBottom:10, animation:"fadeIn .3s ease" }}>
+                      <div style={{ display:"flex", gap:8, alignItems:"flex-start", marginBottom:8 }}>
+                        <span style={{ color:"#FBBF24", fontSize:16, marginTop:1 }}>⚠</span>
+                        <div>
+                          <div style={{ fontSize:13, color:"#FBBF24", fontWeight:700, marginBottom:4 }}>Consistency Error #{i+1}</div>
+                          <div style={{ fontSize:14, color:"#C9D1D9", fontFamily:"'Noto Serif Devanagari',serif", lineHeight:1.7 }}>{e.explanation}</div>
+                        </div>
+                      </div>
+                      <div style={{ display:"grid", gridTemplateColumns:"1fr auto 1fr", gap:8, alignItems:"center" }}>
+                        <div style={{ background:"#2D1A00", border:"1px solid #9A6700", borderRadius:6, padding:"8px 12px", fontSize:15, color:"#FBBF24", fontFamily:"'Noto Serif Devanagari',serif", fontWeight:600 }}>{e.original}</div>
+                        <span style={{ color:"#484F58", fontSize:18 }}>→</span>
+                        <div style={{ background:"#003D00", border:"1px solid #238636", borderRadius:6, padding:"8px 12px", fontSize:15, color:"#4ADE80", fontFamily:"'Noto Serif Devanagari',serif", fontWeight:600 }}>{e.correction}</div>
                       </div>
                     </div>
-                    
-                    {/* Right: AI Rewritten News */}
-                    <div className="w-full md:w-1/2 p-4 overflow-y-auto bg-[#161B22]">
-                      <div className="lbl mb-4 text-[#25D366]">Dainik Bhaskar Formatted News</div>
-                      
-                      {waProcessing ? (
-                        <div className="flex flex-col items-center justify-center h-40 gap-3">
-                          <svg className="animate-spin h-6 w-6 text-[#25D366]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                          <span className="text-sm text-[#8B949E]">Converting to press format... {Math.round(progress)}%</span>
-                        </div>
-                      ) : selectedWa.status === "processed" ? (
-                        <div className="bg-[#0D1117] p-5 rounded-lg border border-green-900/30 text-base text-[#E6EDF3] font-['Noto_Serif_Devanagari'] leading-loose whitespace-pre-wrap">
-                          {selectedWa.rewritten}
-                        </div>
-                      ) : null}
+                  ))}
+                </div>
+              )}
+
+              {/* HEADLINES */}
+              {activeTab==="headlines" && (
+                <div style={{ animation:"fadeIn .25s ease" }}>
+                  <div style={{ background:"#0D1117", border:"1px solid #21262D", borderRadius:8, padding:"14px 16px", marginBottom:16 }}>
+                    <div className="lbl" style={{ marginBottom:10 }}>Headline Generator Settings</div>
+                    <div style={{ display:"flex", gap:10, marginBottom:10, flexWrap:"wrap", alignItems:"center" }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                        <span style={{ fontSize:11, color:"#6E7681" }}>Headline limit</span>
+                        <input type="number" className="ninp" placeholder="words" value={hlHeadLimit} onChange={e=>setHlHeadLimit(e.target.value)} min="0" />
+                      </div>
+                      <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                        <span style={{ fontSize:11, color:"#6E7681" }}>Sub-headline limit</span>
+                        <input type="number" className="ninp" placeholder="words" value={hlSubLimit} onChange={e=>setHlSubLimit(e.target.value)} min="0" />
+                      </div>
+                    </div>
+                    <textarea className="tinp" value={hlPrompt} onChange={e=>setHlPrompt(e.target.value)} placeholder="Custom instruction e.g. dramatic tone, political angle, Madhya Pradesh audience…" rows={2} />
+                    <div style={{ marginTop:10, display:"flex", justifyContent:"flex-end" }}>
+                      <button className="btn-r" onClick={genHeadlines} disabled={hlLoading||!article.trim()}>
+                        {hlLoading?<><Spinner/>Generating…</>:<>⚡ Regenerate Pairs</>}
+                      </button>
                     </div>
                   </div>
+                  {customPairs&&<div style={{ background:"#1C2128", border:"1px solid #C8102E33", borderRadius:6, padding:"6px 12px", marginBottom:12, fontSize:12, color:"#C8102E" }}>✦ Custom pairs</div>}
+                  <div className="lbl" style={{ marginBottom:10 }}>Headline + Sub-Headline Pairs ({displayPairs.length})</div>
+                  {displayPairs.map((p,i)=><PairCard key={i} p={p} i={i} hlHeadLimit={hlHeadLimit} hlSubLimit={hlSubLimit} />)}
+                </div>
+              )}
+
+              {/* MISSING */}
+              {activeTab==="missing" && (
+                <div style={{ animation:"fadeIn .25s ease" }}>
+                  <div style={{ marginBottom:12, fontSize:13, color:"#8B949E" }}>Important journalistic elements missing or weak in your story:</div>
+                  {analysis.missing_elements?.map((m,i)=>(
+                    <div key={i} style={{ display:"flex", gap:8, padding:"10px 12px", background:"#0D1117", border:"1px solid #21262D", borderLeft:"3px solid #F87171", borderRadius:"0 6px 6px 0", marginBottom:8 }}>
+                      <span style={{ color:"#F87171", fontWeight:700 }}>⚠</span>
+                      <span style={{ fontSize:14, color:"#C9D1D9", fontFamily:"'Noto Serif Devanagari',serif", lineHeight:1.7 }}>{m}</span>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
           </div>
         )}
 
+        {/* Empty state */}
+        {!analysis && !loading && !mediaResult && !pressnoteResult && (
+          <div style={{ textAlign:"center", padding:"36px 0" }}>
+            <div style={{ fontSize:36, opacity:.1, marginBottom:10 }}>📰</div>
+            <div style={{ fontSize:14, color:"#484F58", fontWeight:500 }}>Write your story or paste a press note to get started</div>
+            <div style={{ fontSize:12, color:"#30363D", marginTop:5 }}>Grammar · Consistency Check · 20 Headlines · DB Rewrite · File Upload · Translate</div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ borderTop:"1px solid #21262D", padding:"10px 24px", textAlign:"center" }}>
+        <div style={{ fontSize:10, color:"#30363D", letterSpacing:.8, textTransform:"uppercase" }}>Dainik Bhaskar NewsDesk · Gemini AI · Professional Reporter Suite</div>
       </div>
     </div>
   );
