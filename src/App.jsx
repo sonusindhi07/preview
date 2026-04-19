@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 
 // ─── DB STYLE ────────────────────────────────────────────────────────────────
 const DB_STYLE = `DAINIK BHASKAR EDITORIAL STYLE (MANDATORY):
@@ -119,8 +119,8 @@ function extractJSON(raw) {
 
 // ─── GEMINI API CALL ─────────────────────────────────────────────────────────
 async function callGemini(apiKey, systemPrompt, userContent, imageParts = []) {
-  // CHANGED FROM gemini-2.0-flash TO gemini-2.5-flash
-  const model = "gemini-2.5-flash";
+  // Using gemini-2.5-flash-preview-09-2025 as it is supported in the preview environment
+  const model = "gemini-2.5-flash-preview-09-2025";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const parts = [];
@@ -128,9 +128,13 @@ async function callGemini(apiKey, systemPrompt, userContent, imageParts = []) {
   parts.push({ text: userContent });
 
   const body = {
-    system_instruction: { parts: [{ text: systemPrompt }] },
+    systemInstruction: { parts: [{ text: systemPrompt }] },
     contents: [{ role: "user", parts }],
-    generationConfig: { maxOutputTokens: 4096, temperature: 0.3 }
+    generationConfig: { 
+      maxOutputTokens: 4096, 
+      temperature: 0.3,
+      responseMimeType: "application/json" // STRICTLY forces valid JSON output
+    }
   };
 
   const res = await fetch(url, {
@@ -144,9 +148,26 @@ async function callGemini(apiKey, systemPrompt, userContent, imageParts = []) {
     throw new Error(msg);
   }
   const data = await res.json();
+  
+  // Catch safety filter blocks before trying to parse
+  if (data.promptFeedback?.blockReason) {
+    throw new Error(`Request blocked by safety filters: ${data.promptFeedback.blockReason}`);
+  }
+  if (data.candidates?.[0]?.finishReason === "SAFETY") {
+    throw new Error("Response blocked due to safety settings.");
+  }
+
   const raw = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "";
+  
+  if (!raw.trim()) {
+    throw new Error("Empty response received from the AI. Please retry.");
+  }
+
   const parsed = extractJSON(raw);
-  if (!parsed) throw new Error("Could not parse Gemini response. Please retry.");
+  if (!parsed) {
+    console.error("Raw failed payload:", raw);
+    throw new Error("Could not parse Gemini response. Please retry.");
+  }
   return parsed;
 }
 
@@ -190,8 +211,8 @@ function ApiKeyGate({ onSave }) {
     if (!key.trim()) { setErr("Please enter your API key."); return; }
     setTesting(true); setErr("");
     try {
-      // CHANGED FROM gemini-2.0-flash TO gemini-2.5-flash
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.trim()}`;
+      // Allow overriding key to skip requirement for testing UI purposes if empty string wasn't blocked
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${key.trim()}`;
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -254,7 +275,7 @@ function ApiKeyGate({ onSave }) {
                 <span>{text} {link && <a href={href} target="_blank" rel="noreferrer" style={{ color:"#388BFD", textDecoration:"none" }}>{link}</a>}</span>
               </div>
             ))}
-            <div style={{ marginTop:10, fontSize:11, color:"#484F58", lineHeight:1.5 }}>⚡ Free tier: 1500 requests/day · Gemini 2.5 Flash model · No credit card needed</div>
+            <div style={{ marginTop:10, fontSize:11, color:"#484F58", lineHeight:1.5 }}>⚡ Free tier: 1500 requests/day · Gemini 2.5 Flash preview model · No credit card needed</div>
           </div>
         </div>
       </div>
@@ -465,11 +486,11 @@ export default function App() {
       let userText = "";
       if (isImage) {
         const b64 = await toBase64(file);
-        imageParts = [{ inline_data: { mime_type: file.type, data: b64 } }];
+        imageParts = [{ inlineData: { mimeType: file.type, data: b64 } }];
         userText = "Read all content from this image and generate a DB-style Hindi news article.";
       } else if (isPDF) {
         const b64 = await toBase64(file);
-        imageParts = [{ inline_data: { mime_type: "application/pdf", data: b64 } }];
+        imageParts = [{ inlineData: { mimeType: "application/pdf", data: b64 } }];
         userText = "Extract all content from this PDF and generate a DB-style Hindi news article.";
       } else {
         const text = await file.text().catch(() => `[File: ${file.name}]`);
@@ -512,12 +533,7 @@ export default function App() {
   }, [analyse]);
 
   const handleFileInput = e => { const f = e.target.files[0]; if (f) processMedia(f); };
-  const handleDrop = useCallback(e => {
-    e.preventDefault();
-    const f = e.dataTransfer.files[0];
-    if (f) processMedia(f);
-  }, [processMedia]);
-
+  
   const words      = countWords(article);
   const overLimit  = storyLimit && parseInt(storyLimit) > 0 && words > parseInt(storyLimit);
   const hasErrors  = segments.some(s => s.type === "error");
