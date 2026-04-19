@@ -119,7 +119,8 @@ function extractJSON(raw) {
 
 // ─── GEMINI API CALL ─────────────────────────────────────────────────────────
 async function callGemini(apiKey, systemPrompt, userContent, imageParts = []) {
-  const model = "gemini-2.0-flash";
+  // CHANGED FROM gemini-2.0-flash TO gemini-2.5-flash
+  const model = "gemini-2.5-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const parts = [];
@@ -189,7 +190,8 @@ function ApiKeyGate({ onSave }) {
     if (!key.trim()) { setErr("Please enter your API key."); return; }
     setTesting(true); setErr("");
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key.trim()}`;
+      // CHANGED FROM gemini-2.0-flash TO gemini-2.5-flash
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key.trim()}`;
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -252,7 +254,7 @@ function ApiKeyGate({ onSave }) {
                 <span>{text} {link && <a href={href} target="_blank" rel="noreferrer" style={{ color:"#388BFD", textDecoration:"none" }}>{link}</a>}</span>
               </div>
             ))}
-            <div style={{ marginTop:10, fontSize:11, color:"#484F58", lineHeight:1.5 }}>⚡ Free tier: 1500 requests/day · Gemini 2.0 Flash model · No credit card needed</div>
+            <div style={{ marginTop:10, fontSize:11, color:"#484F58", lineHeight:1.5 }}>⚡ Free tier: 1500 requests/day · Gemini 2.5 Flash model · No credit card needed</div>
           </div>
         </div>
       </div>
